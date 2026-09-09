@@ -118,6 +118,49 @@ describe("GitHub review publishing", () => {
     expect(api.pulls.createReview).not.toHaveBeenCalled();
   });
 
+  it("keeps a direct inline thread open while its finding remains", async () => {
+    const finding = {
+      path: "src/a.ts",
+      line: 2,
+      severity: "warning" as const,
+      body: "Check this",
+    };
+    api = octokit();
+    await postReview(api as never, ref, output, [finding], [], logger, {
+      reviewerName: "code",
+      headSha: "a".repeat(40),
+      fileCount: 1,
+    });
+    const createCalls = api.pulls.createReview.mock.calls as unknown[][];
+    const posted = (createCalls[0]![0] as { comments: Array<{ body: string }> })
+      .comments[0]?.body;
+    expect(posted).toContain("<!-- loupe:finding:code id=");
+
+    api = octokit(
+      [],
+      [
+        {
+          id: "thread-code",
+          isResolved: false,
+          path: "src/a.ts",
+          comments: { nodes: [{ body: posted! }] },
+        },
+      ],
+    );
+    await postReview(api as never, ref, output, [finding], [], logger, {
+      reviewerName: "code",
+      headSha: "b".repeat(40),
+      refreshPaths: new Set(["src/a.ts"]),
+      fileCount: 1,
+    });
+
+    const mutations = (api.graphql.mock.calls as unknown[][]).filter(
+      ([query]) => String(query).includes("mutation LoupeResolveReviewThread"),
+    );
+    expect(mutations).toHaveLength(0);
+    expect(api.pulls.createReview).not.toHaveBeenCalled();
+  });
+
   it("resolves prior reviewer threads instead of deleting their comments", async () => {
     api = octokit(
       [],
