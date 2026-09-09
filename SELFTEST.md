@@ -4,3 +4,7 @@ This file exists only to give loupe something to review on a throwaway PR.
 
 - It is not part of the real codebase.
 - Safe to delete.
+
+## second change
+
+One more line so the PR head moves.
