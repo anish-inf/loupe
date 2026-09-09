@@ -350,6 +350,8 @@ export async function postReview(
     : "loupe review";
   const tag = makeMarker(opts.reviewerName, opts.headSha);
   const summaryTag = makeSummaryMarker(opts.reviewerName, opts.headSha);
+  const shortSha = opts.headSha.slice(0, 7);
+  const lastReviewed = `Last reviewed commit: [\`${shortSha}\`](https://github.com/${ref.owner}/${ref.repo}/commit/${opts.headSha})`;
   const stats = statLine(inline, review, opts.fileCount);
   const summaryBody = renderReviewBody(
     title,
@@ -357,7 +359,7 @@ export async function postReview(
     review,
     inline,
     dropped,
-    summaryTag,
+    `${lastReviewed}\n\n${summaryTag}`,
   );
 
   if (inline.length > 0 || hasBlocker) {

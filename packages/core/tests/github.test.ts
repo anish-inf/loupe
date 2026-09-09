@@ -67,7 +67,9 @@ describe("GitHub review publishing", () => {
     );
     expect(api.issues.createComment).toHaveBeenCalledWith(
       expect.objectContaining({
-        body: expect.stringContaining("<!-- loupe:summary:code sha="),
+        body: expect.stringMatching(
+          /Last reviewed commit: \[`aaaaaaa`\]\(https:\/\/github\.com\/context-labs\/loupe\/commit\/a{40}\)[\s\S]*<!-- loupe:summary:code sha=/,
+        ),
       }),
     );
   });
@@ -90,7 +92,12 @@ describe("GitHub review publishing", () => {
     });
 
     expect(api.issues.updateComment).toHaveBeenCalledWith(
-      expect.objectContaining({ comment_id: 7 }),
+      expect.objectContaining({
+        comment_id: 7,
+        body: expect.stringContaining(
+          `Last reviewed commit: [\`ddddddd\`](https://github.com/context-labs/loupe/commit/${"d".repeat(40)})`,
+        ),
+      }),
     );
     expect(api.issues.createComment).not.toHaveBeenCalled();
     expect(api.pulls.createReview).not.toHaveBeenCalled();
