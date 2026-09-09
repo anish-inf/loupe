@@ -19,11 +19,33 @@ const output = {
 
 function octokit(
   issueComments: Array<{ id: number; body?: string | null }> = [],
+  reviewThreads: Array<{
+    id: string;
+    isResolved: boolean;
+    path: string;
+    comments: { nodes: Array<{ body: string }> };
+  }> = [],
 ) {
   return {
+    graphql: vi.fn(async (query: string) => {
+      if (query.includes("query LoupeReviewThreads")) {
+        return {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: reviewThreads,
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        };
+      }
+      return {
+        resolveReviewThread: { thread: { id: "resolved", isResolved: true } },
+      };
+    }),
     paginate: vi.fn(async (method: unknown) => {
       if (method === api.issues.listComments) return issueComments;
-      if (method === api.pulls.listReviewComments) return [];
       if (method === api.pulls.listReviews) return [];
       return [];
     }),
@@ -94,6 +116,60 @@ describe("GitHub review publishing", () => {
     );
     expect(api.issues.createComment).not.toHaveBeenCalled();
     expect(api.pulls.createReview).not.toHaveBeenCalled();
+  });
+
+  it("resolves prior reviewer threads instead of deleting their comments", async () => {
+    api = octokit(
+      [],
+      [
+        {
+          id: "thread-code",
+          isResolved: false,
+          path: "src/a.ts",
+          comments: {
+            nodes: [
+              { body: `warning\n<!-- loupe:code sha=${"a".repeat(40)} -->` },
+            ],
+          },
+        },
+        {
+          id: "thread-security",
+          isResolved: false,
+          path: "src/a.ts",
+          comments: {
+            nodes: [
+              {
+                body: `warning\n<!-- loupe:security sha=${"a".repeat(40)} -->`,
+              },
+            ],
+          },
+        },
+        {
+          id: "thread-unchanged",
+          isResolved: false,
+          path: "src/b.ts",
+          comments: {
+            nodes: [
+              { body: `warning\n<!-- loupe:code sha=${"a".repeat(40)} -->` },
+            ],
+          },
+        },
+      ],
+    );
+
+    await postReview(api as never, ref, output, [], [], logger, {
+      reviewerName: "code",
+      headSha: "b".repeat(40),
+      refreshPaths: new Set(["src/a.ts"]),
+      fileCount: 1,
+    });
+
+    const mutations = (api.graphql.mock.calls as unknown[][]).filter(
+      ([query]) => String(query).includes("mutation LoupeResolveReviewThread"),
+    );
+    expect(mutations).toHaveLength(1);
+    expect(mutations[0]?.[1]).toEqual({ threadId: "thread-code" });
+    expect(api.pulls.deleteReviewComment).not.toHaveBeenCalled();
   });
 
   it("posts a marker-only changes-requested review for a blocker concern", async () => {
