@@ -193,13 +193,29 @@ async function listIssueComments(octokit: Octokit, ref: PullRef) {
   });
 }
 
+type ReviewThreadsPage = {
+  repository: {
+    pullRequest: {
+      reviewThreads: {
+        nodes: Array<{
+          id: string;
+          isResolved: boolean;
+          path: string;
+          comments: { nodes: Array<{ body: string }> };
+        }>;
+        pageInfo: { hasNextPage: boolean; endCursor: string | null };
+      };
+    } | null;
+  } | null;
+};
+
 /**
- * Delete this reviewer's inline comments from a previous run so re-reviews
- * replace rather than duplicate. When `refreshPaths` is given (incremental
- * review), only comments on those files are removed — comments on files
- * unchanged since the last review are kept. Best-effort: never blocks posting.
+ * Resolve this reviewer's prior threads before posting replacement findings.
+ * This preserves the discussion history and lets GitHub show fixed findings as
+ * resolved. During incremental review, threads on unchanged files are kept
+ * open. Best-effort: a lookup or mutation failure never blocks posting.
  */
-async function deletePriorComments(
+async function resolvePriorThreads(
   octokit: Octokit,
   ref: PullRef,
   reviewerName: string | undefined,
@@ -208,28 +224,60 @@ async function deletePriorComments(
 ): Promise<void> {
   const prefix = markerPrefix(reviewerName);
   try {
-    const comments = await octokit.paginate(octokit.pulls.listReviewComments, {
-      owner: ref.owner,
-      repo: ref.repo,
-      pull_number: ref.pull_number,
-      per_page: 100,
-    });
-    const mine = comments.filter(
-      (c) =>
-        c.body.includes(prefix) && (!refreshPaths || refreshPaths.has(c.path)),
-    );
-    for (const c of mine) {
-      await octokit.pulls.deleteReviewComment({
-        owner: ref.owner,
-        repo: ref.repo,
-        comment_id: c.id,
-      });
-    }
-    if (mine.length > 0) {
-      logger.debug("Removed prior loupe comments", { count: mine.length });
+    let cursor: string | null = null;
+    let resolved = 0;
+    do {
+      const data: ReviewThreadsPage = await octokit.graphql(
+        `query LoupeReviewThreads($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $cursor) {
+                nodes {
+                  id
+                  isResolved
+                  path
+                  comments(first: 100) { nodes { body } }
+                }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }`,
+        {
+          owner: ref.owner,
+          repo: ref.repo,
+          number: ref.pull_number,
+          cursor,
+        },
+      );
+      const page = data.repository?.pullRequest?.reviewThreads;
+      if (!page) break;
+      const mine = page.nodes.filter(
+        (thread) =>
+          !thread.isResolved &&
+          (!refreshPaths || refreshPaths.has(thread.path)) &&
+          thread.comments.nodes.some((comment) =>
+            comment.body.includes(prefix),
+          ),
+      );
+      for (const thread of mine) {
+        await octokit.graphql(
+          `mutation LoupeResolveReviewThread($threadId: ID!) {
+            resolveReviewThread(input: {threadId: $threadId}) {
+              thread { id isResolved }
+            }
+          }`,
+          { threadId: thread.id },
+        );
+        resolved += 1;
+      }
+      cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+    } while (cursor);
+    if (resolved > 0) {
+      logger.debug("Resolved prior loupe threads", { count: resolved });
     }
   } catch (err) {
-    logger.warn("Could not clean up prior loupe comments", {
+    logger.warn("Could not resolve prior loupe threads", {
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -334,7 +382,7 @@ export async function postReview(
   logger: Logger,
   opts: PostReviewOptions,
 ): Promise<void> {
-  await deletePriorComments(
+  await resolvePriorThreads(
     octokit,
     ref,
     opts.reviewerName,
