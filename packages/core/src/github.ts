@@ -64,8 +64,10 @@ export async function getLastReviewedSha(
   reviewerName: string | undefined,
 ): Promise<string | undefined> {
   try {
+    const selfLogin = await getSelfLogin(octokit);
     const comments = await listIssueComments(octokit, ref);
     for (const comment of comments.reverse()) {
+      if (comment.user?.login !== selfLogin) continue;
       const sha = shaFromMarker(
         comment.body,
         summaryMarkerPrefix(reviewerName),
@@ -78,6 +80,7 @@ export async function getLastReviewedSha(
       per_page: 100,
     });
     for (const review of reviews.reverse()) {
+      if (review.user?.login !== selfLogin) continue;
       const sha = shaFromMarker(review.body, markerPrefix(reviewerName));
       if (sha) return sha;
     }
@@ -184,6 +187,11 @@ function shaFromMarker(
   return /sha=([0-9a-f]{7,40})\s*-->/.exec(body.slice(start))?.[1];
 }
 
+async function getSelfLogin(octokit: Octokit): Promise<string> {
+  const { data } = await octokit.users.getAuthenticated();
+  return data.login;
+}
+
 async function listIssueComments(octokit: Octokit, ref: PullRef) {
   return octokit.paginate(octokit.issues.listComments, {
     owner: ref.owner,
@@ -201,7 +209,9 @@ type ReviewThreadsPage = {
           id: string;
           isResolved: boolean;
           path: string;
-          comments: { nodes: Array<{ body: string }> };
+          comments: {
+            nodes: Array<{ body: string; author: { login: string } | null }>;
+          };
         }>;
         pageInfo: { hasNextPage: boolean; endCursor: string | null };
       };
@@ -224,6 +234,7 @@ async function resolvePriorThreads(
 ): Promise<void> {
   const prefix = markerPrefix(reviewerName);
   try {
+    const selfLogin = await getSelfLogin(octokit);
     let cursor: string | null = null;
     let resolved = 0;
     do {
@@ -236,7 +247,7 @@ async function resolvePriorThreads(
                   id
                   isResolved
                   path
-                  comments(first: 100) { nodes { body } }
+                  comments(first: 100) { nodes { body author { login } } }
                 }
                 pageInfo { hasNextPage endCursor }
               }
@@ -256,8 +267,10 @@ async function resolvePriorThreads(
         (thread) =>
           !thread.isResolved &&
           (!refreshPaths || refreshPaths.has(thread.path)) &&
-          thread.comments.nodes.some((comment) =>
-            comment.body.includes(prefix),
+          thread.comments.nodes.some(
+            (comment) =>
+              comment.author?.login === selfLogin &&
+              comment.body.includes(prefix),
           ),
       );
       for (const thread of mine) {
@@ -315,8 +328,11 @@ function renderReviewBody(
   inline: readonly Finding[],
   dropped: readonly Finding[],
   tag: string,
+  scopeNote?: string,
 ): string {
-  const parts: string[] = [`### 🔍 ${title}\n\n${stats}`];
+  const parts: string[] = [
+    `### 🔍 ${title}\n\n${stats}${scopeNote ? `\n\n_${scopeNote}_` : ""}`,
+  ];
   if (review.summary.trim()) parts.push(review.summary.trim());
 
   if (review.concerns.length > 0) {
@@ -408,6 +424,9 @@ export async function postReview(
     inline,
     dropped,
     `${lastReviewed}\n\n${summaryTag}`,
+    opts.refreshPaths
+      ? `Incremental review of ${opts.refreshPaths.size} changed file${opts.refreshPaths.size === 1 ? "" : "s"}; unresolved findings on untouched files may still apply.`
+      : undefined,
   );
 
   if (inline.length > 0 || hasBlocker) {
@@ -425,11 +444,14 @@ export async function postReview(
     });
   }
 
+  const selfLogin = await getSelfLogin(octokit);
   const comments = await listIssueComments(octokit, ref);
   const prior = comments
     .reverse()
-    .find((comment) =>
-      comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)),
+    .find(
+      (comment) =>
+        comment.user?.login === selfLogin &&
+        comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)),
     );
   if (prior) {
     await octokit.issues.updateComment({

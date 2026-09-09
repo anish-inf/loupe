@@ -18,15 +18,24 @@ const output = {
 };
 
 function octokit(
-  issueComments: Array<{ id: number; body?: string | null }> = [],
+  issueComments: Array<{
+    id: number;
+    body?: string | null;
+    user?: { login: string } | null;
+  }> = [],
   reviewThreads: Array<{
     id: string;
     isResolved: boolean;
     path: string;
-    comments: { nodes: Array<{ body: string }> };
+    comments: {
+      nodes: Array<{ body: string; author: { login: string } | null }>;
+    };
   }> = [],
 ) {
   return {
+    users: {
+      getAuthenticated: vi.fn(async () => ({ data: { login: "loupe-bot" } })),
+    },
     graphql: vi.fn(async (query: string) => {
       if (query.includes("query LoupeReviewThreads")) {
         return {
@@ -100,10 +109,12 @@ describe("GitHub review publishing", () => {
     api = octokit([
       {
         id: 7,
+        user: { login: "loupe-bot" },
         body: `old\n\n<!-- loupe:summary:code sha=${"b".repeat(40)} -->`,
       },
       {
         id: 8,
+        user: { login: "loupe-bot" },
         body: `other\n\n<!-- loupe:summary:security sha=${"c".repeat(40)} -->`,
       },
     ]);
@@ -135,7 +146,10 @@ describe("GitHub review publishing", () => {
           path: "src/a.ts",
           comments: {
             nodes: [
-              { body: `warning\n<!-- loupe:code sha=${"a".repeat(40)} -->` },
+              {
+                body: `warning\n<!-- loupe:code sha=${"a".repeat(40)} -->`,
+                author: { login: "loupe-bot" },
+              },
             ],
           },
         },
@@ -147,6 +161,7 @@ describe("GitHub review publishing", () => {
             nodes: [
               {
                 body: `warning\n<!-- loupe:security sha=${"a".repeat(40)} -->`,
+                author: { login: "loupe-bot" },
               },
             ],
           },
@@ -157,7 +172,23 @@ describe("GitHub review publishing", () => {
           path: "src/b.ts",
           comments: {
             nodes: [
-              { body: `warning\n<!-- loupe:code sha=${"a".repeat(40)} -->` },
+              {
+                body: `warning\n<!-- loupe:code sha=${"a".repeat(40)} -->`,
+                author: { login: "loupe-bot" },
+              },
+            ],
+          },
+        },
+        {
+          id: "thread-quoted-marker",
+          isResolved: false,
+          path: "src/a.ts",
+          comments: {
+            nodes: [
+              {
+                body: `quoted\n<!-- loupe:code sha=${"a".repeat(40)} -->`,
+                author: { login: "human" },
+              },
             ],
           },
         },
@@ -213,12 +244,26 @@ describe("GitHub review publishing", () => {
     api = octokit([
       {
         id: 7,
+        user: { login: "loupe-bot" },
         body: `summary\n<!-- loupe:summary:code sha=${"e".repeat(40)} -->`,
       },
     ]);
     await expect(getLastReviewedSha(api as never, ref, "code")).resolves.toBe(
       "e".repeat(40),
     );
+  });
+
+  it("ignores copied summary markers from another author", async () => {
+    api = octokit([
+      {
+        id: 7,
+        user: { login: "human" },
+        body: `quote\n<!-- loupe:summary:code sha=${"e".repeat(40)} -->`,
+      },
+    ]);
+    await expect(
+      getLastReviewedSha(api as never, ref, "code"),
+    ).resolves.toBeUndefined();
   });
 
   it("falls back to legacy review markers", async () => {
@@ -229,6 +274,7 @@ describe("GitHub review publishing", () => {
         return [
           {
             id: 9,
+            user: { login: "loupe-bot" },
             body: `legacy\n<!-- loupe:code sha=${"f".repeat(40)} -->`,
           },
         ];
