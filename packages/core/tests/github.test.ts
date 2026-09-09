@@ -28,8 +28,10 @@ function fakeOctokit(opts: {
   const deleteReviewComment = vi.fn(async () => ({ data: {} }));
   const createReview = vi.fn(async () => ({ data: {} }));
   const octokit = {
-    paginate: async (fn: (p: unknown) => Promise<{ data: unknown }>, p: unknown) =>
-      (await fn(p)).data,
+    paginate: async (
+      fn: (p: unknown) => Promise<{ data: unknown }>,
+      p: unknown,
+    ) => (await fn(p)).data,
     pulls: {
       listReviewComments: async () => ({ data: opts.comments ?? [] }),
       listReviews: async () => ({ data: opts.reviews ?? [] }),
@@ -38,12 +40,17 @@ function fakeOctokit(opts: {
     },
     users: {
       getAuthenticated: async () => {
-        if (!opts.login) throw new Error("Resource not accessible by integration");
+        if (!opts.login)
+          throw new Error("Resource not accessible by integration");
         return { data: { login: opts.login } };
       },
     },
   };
-  return { octokit: octokit as unknown as Octokit, deleteReviewComment, createReview };
+  return {
+    octokit: octokit as unknown as Octokit,
+    deleteReviewComment,
+    createReview,
+  };
 }
 
 describe("postReview prior-comment cleanup", () => {
@@ -51,9 +58,24 @@ describe("postReview prior-comment cleanup", () => {
     const { octokit, deleteReviewComment } = fakeOctokit({
       login: "loupe-bot",
       comments: [
-        { id: 1, path: "a.ts", body: `finding\n\n${marker}`, user: { login: "loupe-bot" } },
-        { id: 2, path: "a.ts", body: `this one is real:\n${marker}`, user: { login: "alice" } },
-        { id: 3, path: "a.ts", body: "unrelated", user: { login: "loupe-bot" } },
+        {
+          id: 1,
+          path: "a.ts",
+          body: `finding\n\n${marker}`,
+          user: { login: "loupe-bot" },
+        },
+        {
+          id: 2,
+          path: "a.ts",
+          body: `this one is real:\n${marker}`,
+          user: { login: "alice" },
+        },
+        {
+          id: 3,
+          path: "a.ts",
+          body: "unrelated",
+          user: { login: "loupe-bot" },
+        },
       ],
     });
     await postReview(octokit, ref, emptyReview, [], [], silent, {
@@ -70,7 +92,12 @@ describe("postReview prior-comment cleanup", () => {
   it("falls back to github-actions[bot] when the token cannot call GET /user", async () => {
     const { octokit, deleteReviewComment } = fakeOctokit({
       comments: [
-        { id: 1, path: "a.ts", body: marker, user: { login: "github-actions[bot]" } },
+        {
+          id: 1,
+          path: "a.ts",
+          body: marker,
+          user: { login: "github-actions[bot]" },
+        },
         { id: 2, path: "a.ts", body: marker, user: { login: "alice" } },
       ],
     });
@@ -91,8 +118,14 @@ describe("getLastReviewedSha", () => {
     const { octokit } = fakeOctokit({
       login: "loupe-bot",
       reviews: [
-        { body: "<!-- loupe:bugs sha=1111111 -->", user: { login: "loupe-bot" } },
-        { body: "quoting: <!-- loupe:bugs sha=2222222 -->", user: { login: "alice" } },
+        {
+          body: "<!-- loupe:bugs sha=1111111 -->",
+          user: { login: "loupe-bot" },
+        },
+        {
+          body: "quoting: <!-- loupe:bugs sha=2222222 -->",
+          user: { login: "alice" },
+        },
       ],
     });
     expect(await getLastReviewedSha(octokit, ref, "bugs")).toBe("1111111");
