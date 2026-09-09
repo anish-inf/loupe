@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-
 import { Octokit } from "@octokit/rest";
 
 import type { Logger } from "@loupe/logger";
@@ -176,36 +174,6 @@ function makeSummaryMarker(
 ): string {
   return `${summaryMarkerPrefix(reviewerName)}sha=${sha} -->`;
 }
-function findingMarkerPrefix(reviewerName: string | undefined): string {
-  return `<!-- loupe:finding:${reviewerName ?? "default"} `;
-}
-function findingFingerprint(finding: Pick<Finding, "path" | "body">): string {
-  const normalized = finding.body
-    .toLowerCase()
-    .replace(/[`*_~#[\]()]/g, " ")
-    .replace(/\b\d+\b/g, "#")
-    .replace(/[^a-z0-9#]+/g, " ")
-    .trim()
-    .replace(/\s+/g, " ");
-  return createHash("sha256")
-    .update(`${finding.path}\n${normalized}`)
-    .digest("hex")
-    .slice(0, 20);
-}
-function makeFindingMarker(
-  reviewerName: string | undefined,
-  finding: Finding,
-): string {
-  return `${findingMarkerPrefix(reviewerName)}id=${findingFingerprint(finding)} -->`;
-}
-function findingIdFromBody(
-  body: string,
-  reviewerName: string | undefined,
-): string | undefined {
-  const start = body.indexOf(findingMarkerPrefix(reviewerName));
-  if (start < 0) return undefined;
-  return /id=([0-9a-f]{20})\s*-->/.exec(body.slice(start))?.[1];
-}
 function shaFromMarker(
   body: string | null | undefined,
   prefix: string,
@@ -241,30 +209,20 @@ type ReviewThreadsPage = {
   } | null;
 };
 
-type ReconciledFindings = {
-  readonly newFindings: readonly Finding[];
-  readonly existingCount: number;
-};
-
 /**
- * Match current findings to this reviewer's open threads. Findings that remain
- * are left open and not duplicated; threads whose finding disappeared are
- * resolved. Legacy threads without finding IDs are resolved once when their
- * path is reviewed, then replaced by fingerprinted comments if still relevant.
+ * Resolve this reviewer's prior threads before posting replacement findings.
+ * This preserves the discussion history and lets GitHub show fixed findings as
+ * resolved. During incremental review, threads on unchanged files are kept
+ * open. Best-effort: a lookup or mutation failure never blocks posting.
  */
-async function reconcilePriorThreads(
+async function resolvePriorThreads(
   octokit: Octokit,
   ref: PullRef,
   reviewerName: string | undefined,
-  findings: readonly Finding[],
   logger: Logger,
   refreshPaths?: ReadonlySet<string>,
-): Promise<ReconciledFindings> {
-  const remaining = new Map(
-    findings.map((finding) => [findingFingerprint(finding), finding]),
-  );
+): Promise<void> {
   const prefix = markerPrefix(reviewerName);
-  let existingCount = 0;
   try {
     let cursor: string | null = null;
     let resolved = 0;
@@ -303,13 +261,6 @@ async function reconcilePriorThreads(
           ),
       );
       for (const thread of mine) {
-        const findingId = thread.comments.nodes
-          .map((comment) => findingIdFromBody(comment.body, reviewerName))
-          .find((id) => id !== undefined);
-        if (findingId && remaining.delete(findingId)) {
-          existingCount += 1;
-          continue;
-        }
         await octokit.graphql(
           `mutation LoupeResolveReviewThread($threadId: ID!) {
             resolveReviewThread(input: {threadId: $threadId}) {
@@ -323,15 +274,13 @@ async function reconcilePriorThreads(
       cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
     } while (cursor);
     if (resolved > 0) {
-      logger.debug("Resolved addressed loupe threads", { count: resolved });
+      logger.debug("Resolved prior loupe threads", { count: resolved });
     }
   } catch (err) {
-    logger.warn("Could not reconcile prior loupe threads", {
+    logger.warn("Could not resolve prior loupe threads", {
       error: err instanceof Error ? err.message : String(err),
     });
-    return { newFindings: findings, existingCount: 0 };
   }
-  return { newFindings: [...remaining.values()], existingCount };
 }
 
 const SEV_EMOJI: Record<Finding["severity"], string> = {
@@ -433,11 +382,10 @@ export async function postReview(
   logger: Logger,
   opts: PostReviewOptions,
 ): Promise<void> {
-  const { newFindings, existingCount } = await reconcilePriorThreads(
+  await resolvePriorThreads(
     octokit,
     ref,
     opts.reviewerName,
-    inline,
     logger,
     opts.refreshPaths,
   );
@@ -460,17 +408,17 @@ export async function postReview(
     summaryTag,
   );
 
-  if (newFindings.length > 0 || (hasBlocker && existingCount === 0)) {
+  if (inline.length > 0 || hasBlocker) {
     await octokit.pulls.createReview({
       ...ref,
       event: hasBlocker ? "REQUEST_CHANGES" : "COMMENT",
       // GitHub requires content when a review has no inline comments. Keep that
       // body visually empty while preserving PR-level blocker verdicts.
-      body: newFindings.length > 0 ? "" : tag,
-      comments: newFindings.map((f) => ({
+      body: inline.length > 0 ? "" : tag,
+      comments: inline.map((f) => ({
         path: f.path,
         line: f.line,
-        body: `${SEV_EMOJI[f.severity]} **${f.severity}** ${f.body}\n\n${makeFindingMarker(opts.reviewerName, f)}\n${tag}`,
+        body: `${SEV_EMOJI[f.severity]} **${f.severity}** ${f.body}\n\n${tag}`,
       })),
     });
   }
