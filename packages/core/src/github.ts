@@ -54,6 +54,29 @@ export async function fetchPullContext(
   };
 }
 
+/** Login the workflow token posts as when `GET /user` is unavailable to it. */
+const ACTIONS_BOT_LOGIN = "github-actions[bot]";
+const selfLogins = new WeakMap<Octokit, Promise<string>>();
+
+/**
+ * The login loupe's own comments and reviews carry. A PAT or app user token
+ * answers `GET /user`; the default Actions token cannot, and posts as
+ * github-actions[bot]. Marker text alone is not proof of authorship: a human
+ * quoting loupe output carries the marker too, so every "is this mine" check
+ * pairs the marker with this login.
+ */
+export function getSelfLogin(octokit: Octokit): Promise<string> {
+  let cached = selfLogins.get(octokit);
+  if (!cached) {
+    cached = octokit.users
+      .getAuthenticated()
+      .then((r) => r.data.login)
+      .catch(() => ACTIONS_BOT_LOGIN);
+    selfLogins.set(octokit, cached);
+  }
+  return cached;
+}
+
 /**
  * The head SHA this reviewer last reviewed, read from the sha stamped in its
  * most recent review's marker. Undefined if it has never reviewed this PR.
@@ -65,12 +88,13 @@ export async function getLastReviewedSha(
 ): Promise<string | undefined> {
   const prefix = markerPrefix(reviewerName);
   try {
+    const self = await getSelfLogin(octokit);
     const reviews = await octokit.paginate(octokit.pulls.listReviews, {
       ...ref,
       per_page: 100,
     });
     for (const r of reviews.reverse()) {
-      if (r.body?.includes(prefix)) {
+      if (r.user?.login === self && r.body?.includes(prefix)) {
         const m = /sha=([0-9a-f]{7,40})/.exec(r.body);
         if (m) return m[1];
       }
@@ -163,9 +187,11 @@ function makeMarker(reviewerName: string | undefined, sha: string): string {
 
 /**
  * Delete this reviewer's inline comments from a previous run so re-reviews
- * replace rather than duplicate. When `refreshPaths` is given (incremental
- * review), only comments on those files are removed — comments on files
- * unchanged since the last review are kept. Best-effort: never blocks posting.
+ * replace rather than duplicate. Only comments posted under loupe's own login
+ * qualify; a human comment that quotes the marker is left alone. When
+ * `refreshPaths` is given (incremental review), only comments on those files
+ * are removed — comments on files unchanged since the last review are kept.
+ * Best-effort: never blocks posting.
  */
 async function deletePriorComments(
   octokit: Octokit,
@@ -176,6 +202,7 @@ async function deletePriorComments(
 ): Promise<void> {
   const prefix = markerPrefix(reviewerName);
   try {
+    const self = await getSelfLogin(octokit);
     const comments = await octokit.paginate(octokit.pulls.listReviewComments, {
       owner: ref.owner,
       repo: ref.repo,
@@ -184,7 +211,9 @@ async function deletePriorComments(
     });
     const mine = comments.filter(
       (c) =>
-        c.body.includes(prefix) && (!refreshPaths || refreshPaths.has(c.path)),
+        c.user?.login === self &&
+        c.body.includes(prefix) &&
+        (!refreshPaths || refreshPaths.has(c.path)),
     );
     for (const c of mine) {
       await octokit.pulls.deleteReviewComment({
