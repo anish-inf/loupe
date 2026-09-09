@@ -39,6 +39,37 @@ See `examples/review.example.yml` for whip / claude / custom-prompt
 variants. The live monorepo wiring is `inference/.loupe/` + the
 `inference--loupe-review.yml` workflow.
 
+## GitHub token and thread resolution
+
+The `github-token` input defaults to `${{ github.token }}`. This remains the
+zero-configuration, backwards-compatible setup and is sufficient to read pull
+requests, post inline reviews, and create or update the persistent summary.
+
+Loupe also preserves inline discussions and resolves a thread after its finding
+is addressed. GitHub may reject the GraphQL `resolveReviewThread` mutation for
+the workflow's default installation token with `Resource not accessible by
+integration`. Resolution is best-effort: Loupe logs a warning and leaves the
+thread open; the rest of the review still succeeds.
+
+To enable automatic resolution, pass a fine-grained PAT or GitHub App
+installation token that can access the repository and has **Pull requests: read
+and write**. Store it as an Actions secret and override only this input:
+
+```yaml
+- uses: context-labs/loupe@v0
+  with:
+    github-token: ${{ secrets.LOUPE_GITHUB_TOKEN }}
+    harness: whip
+    config: .loupe.json
+  env:
+    INFERENCE_API_KEY: ${{ secrets.INFERENCE_API_KEY }}
+```
+
+For a fine-grained PAT, restrict repository access to the repositories Loupe
+reviews. Prefer a short-lived GitHub App installation token for organization-wide
+use. Secrets are not normally exposed to workflows triggered by pull requests
+from forks, so keep fork handling and privilege boundaries in mind.
+
 ## Chat: `@loupe` in PR comments
 
 Add a second job triggered by comment events so people can talk to loupe:
@@ -103,5 +134,6 @@ gh api -X PUT repos/context-labs/loupe/actions/permissions/access \
   comments, never a merge gate.
 - **Cadence:** `ready_for_review` + skip drafts + `concurrency: cancel-in-progress`
   so drafts are ignored and rapid pushes collapse to the latest commit.
-- **De-dup:** loupe deletes each reviewer's prior comments before re-posting, so
-  re-reviews replace rather than accumulate.
+- **Thread lifecycle:** loupe posts new findings as inline comments, keeps a
+  matching unresolved thread open without duplicating it, and resolves the
+  thread after the finding is addressed (when the configured token permits it).

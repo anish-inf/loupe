@@ -18,6 +18,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: context-labs/loupe@v0
         with:
+          # Optional: the default github.token still posts reviews and summaries.
+          # Override it to let Loupe resolve addressed review threads when the
+          # default Actions token is rejected by resolveReviewThread.
+          # github-token: ${{ secrets.LOUPE_GITHUB_TOKEN }}
           harness: whip
           model: kimi-k3
           reasoning: medium

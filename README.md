@@ -65,7 +65,12 @@ ANTHROPIC_API_KEY=sk-... \
   bun run packages/action/src/cli.ts review owner/repo#123 --harness claude
 ```
 
-Token comes from `--token`, else `GITHUB_TOKEN`, else `gh auth token`.
+Token comes from `--token`, else `GITHUB_TOKEN`, else `gh auth token`. In the
+Action, `github-token` continues to default to `${{ github.token }}` for backwards
+compatibility; that token can post reviews and update summaries. Automatically
+resolving addressed review threads may require a fine-grained PAT or GitHub App
+token with **Pull requests: read and write**, passed as `github-token`. See
+[GitHub Action authentication](docs/github-action.md#github-token-and-thread-resolution).
 
 Key flags (defaults in parens): `--harness` (whip), `--model` (kimi-k3),
 `--reasoning low|medium|high` (low), `--profile quiet|chill|assertive` (chill),
