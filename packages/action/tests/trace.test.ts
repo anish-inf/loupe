@@ -49,22 +49,17 @@ function sample(): HarnessTraceEvent[] {
 }
 
 describe("renderTraceSection", () => {
-  it("renders a compact overview and collapsible phase details", () => {
+  it("renders a compact trace with collapsible details", () => {
     const md = renderTraceSection("engine", sample(), { harness: "whip" });
     expect(md).toContain("### ✅ engine");
-    expect(md).toContain(
-      "| Agent | Model | Steps | Inspections | Thinking captured |",
-    );
-    expect(md).toContain("| `whip` | `kimi-k3` | 1 | 1 | 55 chars |");
-    expect(md).toContain("#### ✅ 1. Review the change");
-    expect(md).toContain(
-      "<strong>🧠 What the model was thinking about</strong>",
-    );
-    expect(md).toContain("**What Loupe inspected**");
+    expect(md).toContain("`whip` · `kimi-k3` · 1 inspection");
+    expect(md).toContain("#### ✅ Review");
+    expect(md).toContain("<strong>🧠 Thinking</strong>");
+    expect(md).toContain("**Inspected**");
     expect(md).toContain("<summary>1. <code>read</code>");
-    expect(md).toContain("<strong>📝 Result from this step</strong>");
+    expect(md).toContain("<strong>📝 Output</strong>");
     // The terminal output replaces, rather than duplicates, streamed reply text.
-    expect(md.match(/📝 Result from this step/g)).toHaveLength(1);
+    expect(md.match(/📝 Output/g)).toHaveLength(1);
   });
 
   it("separates primary and verification phases", () => {
@@ -83,9 +78,9 @@ describe("renderTraceSection", () => {
         phase: "verify:kimi-k3",
       },
     ]);
-    expect(md).toContain("#### ✅ 1. Review the change");
-    expect(md).toContain("#### ✅ 2. Double-check the findings");
-    expect(md).toContain("| `unknown` | `kimi-k3` | 2 |");
+    expect(md).toContain("#### ✅ Review");
+    expect(md).toContain("#### ✅ Verify findings");
+    expect(md).toContain("`unknown` · `kimi-k3` · 1 inspection");
   });
 
   it("escapes HTML in untrusted event content", () => {
@@ -120,7 +115,7 @@ describe("renderTraceSection", () => {
       [{ type: "done", text: "[]" } as HarnessTraceEvent],
       { harness: "claude" },
     );
-    expect(md).toContain("| `claude` | — | 1 |");
+    expect(md).toContain("`claude` · 0 inspections");
     expect(md).toContain("available only for Whip");
   });
 });
@@ -132,8 +127,8 @@ describe("renderReviewsTrace", () => {
       { reviewer: "migrations", events: [{ type: "done", text: "[]" }] },
     ];
     const md = renderReviewsTrace(traces);
-    expect(md).toContain("## 🔎 How Loupe reviewed this change");
-    expect(md).toContain("> 2 reviewers");
+    expect(md).toContain("## 🔎 Loupe trace");
+    expect(md).toContain("2 reviewers · Review → verify → post");
     expect(md).toContain("### ✅ code");
     expect(md).toContain("### ✅ migrations");
 
@@ -173,7 +168,7 @@ describe("writeReviewsTraceToSummary", () => {
     );
     const output = readFileSync(path, "utf8");
     expect(output).toContain("preexisting");
-    expect(output).toContain("## 🔎 How Loupe reviewed this change");
+    expect(output).toContain("## 🔎 Loupe trace");
     expect(output).toContain("### ✅ code");
   });
 
