@@ -46,6 +46,14 @@ function blob(value: string): string {
     .replace(/>/g, "&gt;");
 }
 
+function fenceFor(value: string): string {
+  const longest = Math.max(
+    0,
+    ...Array.from(value.matchAll(/`+/g), (m) => m[0].length),
+  );
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
 function truncate(value: string, max = BLOB_CHARS): string {
   if (value.length <= max) return value;
   const cut = value.slice(0, max);
@@ -64,7 +72,9 @@ function pretty(value: string): string {
 }
 
 function code(value: string, language = "text", max = BLOB_CHARS): string {
-  return `\`\`\`${language}\n${blob(truncate(pretty(value), max))}\n\`\`\``;
+  const content = blob(truncate(pretty(value), max));
+  const fence = fenceFor(content);
+  return `${fence}${language}\n${content}\n${fence}`;
 }
 
 type PhaseTrace = {
@@ -226,16 +236,18 @@ export function renderTraceSection(
   if (!events.length) out.push("_No trace events were captured._");
   else phases.forEach((phase) => out.push("---", renderPhase(phase)));
 
-  let body = out.join("\n\n");
-  if (body.length > SECTION_MAX_CHARS) {
-    body = `${body.slice(0, SECTION_MAX_CHARS)}\n\n> [!NOTE]\n> Trace truncated at ${SECTION_MAX_CHARS.toLocaleString()} characters. Additional detail remains in the job log.`;
+  const kept: string[] = [];
+  for (const block of out) {
+    const next = [...kept, block].join("\n\n");
+    if (next.length > SECTION_MAX_CHARS) {
+      kept.push(
+        `> [!NOTE]\n> Trace truncated at a complete block. Additional detail remains in the job log.`,
+      );
+      break;
+    }
+    kept.push(block);
   }
-  return body;
-}
-
-function boundSummary(body: string): string {
-  if (body.length <= SUMMARY_MAX_CHARS) return body;
-  return `${body.slice(0, SUMMARY_MAX_CHARS)}\n\n> [!NOTE]\n> Summary truncated at ${SUMMARY_MAX_CHARS.toLocaleString()} characters. Additional detail remains in the job log.`;
+  return kept.join("\n\n");
 }
 
 export function renderReviewsTrace(traces: readonly ReviewerTrace[]): string {
@@ -244,14 +256,20 @@ export function renderReviewsTrace(traces: readonly ReviewerTrace[]): string {
     `${traces.length} reviewer${traces.length === 1 ? "" : "s"} · Review → verify → post`,
   ];
   for (const trace of traces) {
-    parts.push(
-      "",
-      renderTraceSection(trace.reviewer, trace.events, {
-        harness: trace.harness,
-      }),
-    );
+    const section = renderTraceSection(trace.reviewer, trace.events, {
+      harness: trace.harness,
+    });
+    const next = [...parts, "", section].join("\n");
+    if (next.length > SUMMARY_MAX_CHARS) {
+      parts.push(
+        "",
+        "> [!NOTE]\n> Summary truncated between reviewers. Additional detail remains in the job log.",
+      );
+      break;
+    }
+    parts.push("", section);
   }
-  return boundSummary(parts.join("\n"));
+  return parts.join("\n");
 }
 
 export function writeReviewsTraceToSummary(

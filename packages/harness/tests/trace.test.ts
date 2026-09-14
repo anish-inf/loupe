@@ -142,6 +142,6 @@ describe("envSecretValues", () => {
         PATH: "/usr/bin:/bin",
         EMPTY: "",
       }),
-    ).toEqual(["sk-long-enough-to-matter", "/usr/bin:/bin"]);
+    ).toEqual(["sk-long-enough-to-matter"]);
   });
 });

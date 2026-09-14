@@ -95,7 +95,12 @@ export function envSecretValues(
   env: Record<string, string | undefined>,
 ): string[] {
   const out: string[] = [];
-  for (const value of Object.values(env)) {
+  for (const [key, value] of Object.entries(env)) {
+    if (
+      !/(?:^|_)(?:API_?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)(?:$|_)/i.test(key)
+    ) {
+      continue;
+    }
     if (typeof value === "string" && value.length >= MIN_SECRET_LENGTH) {
       out.push(value);
     }

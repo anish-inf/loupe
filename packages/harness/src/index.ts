@@ -114,6 +114,18 @@ function runCli(
   ctx: HarnessContext,
 ): Promise<string> {
   const log = ctx.logger.child(cmd);
+  const secrets = envSecretValues({ ...process.env, ...ctx.env });
+  const emit = (event: HarnessTraceEvent): void =>
+    ctx.trace?.({
+      ...event,
+      ...(event.type === "done"
+        ? { text: redactSecrets(event.text, secrets) }
+        : event.type === "error"
+          ? { error: redactSecrets(event.error, secrets) }
+          : {}),
+      model: event.model ?? ctx.model,
+      phase: event.phase ?? ctx.phase,
+    });
   log.debug("Spawning harness", { args, cwd: ctx.workdir, model: ctx.model });
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
@@ -132,12 +144,21 @@ function runCli(
       stderr += chunk;
       log.debug(chunk.trimEnd());
     });
-    child.on("error", reject);
+    child.on("error", (err) => {
+      emit({ type: "error", error: err.message });
+      reject(err);
+    });
     child.on("close", (code) => {
       log.debug("Harness exited", { code, stdoutChars: stdout.length });
       log.debug("Harness stdout", { stdout });
-      if (code === 0) resolve(stdout);
-      else reject(new Error(`${cmd} exited ${code}: ${stderr.slice(0, 2000)}`));
+      if (code === 0) {
+        emit({ type: "done", text: stdout });
+        resolve(stdout);
+      } else {
+        const error = `${cmd} exited ${code}: ${stderr.slice(0, 2000)}`;
+        emit({ type: "error", error });
+        reject(new Error(error));
+      }
     });
     child.stdin.write(stdin);
     child.stdin.end();
@@ -210,7 +231,7 @@ function runWhipStreaming(
   // Known secrets (resolved credential values handed to the subprocess via env)
   // are scrubbed from every trace payload downstream so an API key that happens
   // to surface in a tool result or reasoning chunk never lands in the summary.
-  const secrets = envSecretValues(ctx.env);
+  const secrets = envSecretValues({ ...process.env, ...ctx.env });
   const scrub = (s: string | undefined): string | undefined =>
     s === undefined ? undefined : redactSecrets(s, secrets);
   // Scrub every string field on an event (delta/args/result/text/error).

@@ -83,6 +83,15 @@ describe("renderTraceSection", () => {
     expect(md).toContain("`unknown` · `kimi-k3` · 1 inspection");
   });
 
+  it("uses a longer fence when output contains backticks", () => {
+    const md = renderTraceSection("x", [
+      { type: "done", text: "before\n```ts\nconst x = 1\n```\nafter" },
+    ] as HarnessTraceEvent[]);
+    expect(md).toContain("````json");
+    expect(md).toContain("```ts");
+    expect(md).toContain("\n````\n");
+  });
+
   it("escapes HTML in untrusted event content", () => {
     const md = renderTraceSection("x", [
       { type: "tool_start", name: "grep", args: "pattern <details>" },
@@ -146,7 +155,7 @@ describe("renderTraceSection", () => {
 });
 
 describe("renderReviewsTrace", () => {
-  it("renders every reviewer and stays bounded", () => {
+  it("renders every reviewer and truncates only between complete sections", () => {
     const traces: ReviewerTrace[] = [
       { reviewer: "code", harness: "whip", events: sample() },
       { reviewer: "migrations", events: [{ type: "done", text: "[]" }] },
@@ -164,6 +173,19 @@ describe("renderReviewsTrace", () => {
     const bounded = renderReviewsTrace([{ reviewer: "huge", events: huge }]);
     expect(bounded.length).toBeLessThan(100000);
     expect(bounded).toContain("truncated (40,000 characters total)");
+
+    const many = Array.from({ length: 30 }, (_, i) => ({
+      reviewer: `reviewer-${i}`,
+      events: [
+        { type: "reasoning", delta: "z".repeat(30000) },
+        { type: "done", text: "ok" },
+      ] as HarnessTraceEvent[],
+    }));
+    const summary = renderReviewsTrace(many);
+    expect(summary).toContain("Summary truncated between reviewers");
+    expect((summary.match(/<details>/g) ?? []).length).toBe(
+      (summary.match(/<\/details>/g) ?? []).length,
+    );
   });
 });
 
