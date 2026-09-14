@@ -7,6 +7,7 @@ export const SECTION_MAX_CHARS = 30000;
 export const SUMMARY_MAX_CHARS = 100000;
 export const BLOB_CHARS = 4000;
 export const REASONING_CHARS = 6000;
+const PHASE_MAX_CHARS = 24000;
 
 export type ReviewerTrace = {
   readonly reviewer: string;
@@ -161,15 +162,29 @@ function renderPhase(phase: PhaseTrace): string {
   ].filter(Boolean);
   const out = [`#### ${status} ${phaseTitle(phase)}`, stats.join(" · ")];
 
-  if (reasoning) {
-    out.push(
+  const pushBlock = (block: string): boolean => {
+    if ([...out, block].join("\n\n").length > PHASE_MAX_CHARS) {
+      out.push(
+        "> [!NOTE]\n> Phase truncated at a complete block. Additional detail remains in the job log.",
+      );
+      return false;
+    }
+    out.push(block);
+    return true;
+  };
+
+  if (
+    reasoning &&
+    !pushBlock(
       `<details>\n<summary><strong>🧠 Thinking</strong> · ${reasoning.length.toLocaleString()} chars</summary>\n\n${code(reasoning, "text", REASONING_CHARS)}\n\n</details>`,
-    );
+    )
+  ) {
+    return out.filter(Boolean).join("\n\n");
   }
 
   if (tools.length) {
     out.push("**Inspected**");
-    tools.forEach((tool, index) => {
+    for (const [index, tool] of tools.entries()) {
       const summary = `${index + 1}. <code>${inline(tool.name)}</code>${tool.args ? ` · ${inline(truncate(tool.args, 180))}` : ""}`;
       const body = [
         tool.args ? `**Input**\n\n${code(tool.args, "json")}` : undefined,
@@ -179,18 +194,25 @@ function renderPhase(phase: PhaseTrace): string {
       ]
         .filter(Boolean)
         .join("\n\n");
-      out.push(
-        `<details>\n<summary>${summary}</summary>\n\n${body}\n\n</details>`,
-      );
-    });
+      if (
+        !pushBlock(
+          `<details>\n<summary>${summary}</summary>\n\n${body}\n\n</details>`,
+        )
+      ) {
+        return out.filter(Boolean).join("\n\n");
+      }
+    }
   }
 
   // The final done payload normally repeats the streamed reply. Show one copy.
   const final = outcome?.status === "done" ? outcome.text : reply;
-  if (final) {
-    out.push(
+  if (
+    final &&
+    !pushBlock(
       `<details>\n<summary><strong>📝 Output</strong> · ${final.length.toLocaleString()} chars</summary>\n\n${code(final, "json")}\n\n</details>`,
-    );
+    )
+  ) {
+    return out.filter(Boolean).join("\n\n");
   }
 
   if (outcome?.status === "error") {

@@ -120,6 +120,24 @@ describe("renderTraceSection", () => {
     expect(md.match(/<summary>\d+\. <code>/g)).toHaveLength(4);
   });
 
+  it("keeps complete early blocks when a phase exceeds its cap", () => {
+    const events: HarnessTraceEvent[] = [
+      { type: "reasoning", delta: "r".repeat(1000) },
+      ...Array.from({ length: 12 }, (_, i) => [
+        { type: "tool_start", name: "read", args: `file-${i}` },
+        { type: "tool_end", name: "read", result: "x".repeat(4000) },
+      ]).flat(),
+      { type: "done", text: "ok" },
+    ] as HarnessTraceEvent[];
+    const md = renderTraceSection("large", events);
+    expect(md).toContain("🧠 Thinking");
+    expect(md).toContain("file-0");
+    expect(md).toContain("Phase truncated at a complete block");
+    expect((md.match(/<details>/g) ?? []).length).toBe(
+      (md.match(/<\/details>/g) ?? []).length,
+    );
+  });
+
   it("marks a partial stream without a terminal event", () => {
     const md = renderTraceSection("x", [
       { type: "reasoning", delta: "still working" },
