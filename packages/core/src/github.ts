@@ -686,14 +686,41 @@ function priorReviewerSection(
   reviewer: string,
 ): string | undefined {
   const escaped = reviewer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const startMarker = `<!-- loupe:section:${reviewer}:start -->`;
+  const endMarker = `<!-- loupe:section:${reviewer}:end -->`;
+  const markedStart = priorBody.indexOf(startMarker);
+  if (markedStart >= 0) {
+    const markedEnd = priorBody.indexOf(endMarker, markedStart);
+    if (markedEnd >= 0) {
+      return priorBody
+        .slice(markedStart + startMarker.length + 1, markedEnd)
+        .trim();
+    }
+  }
+
+  // Legacy combined summaries had no section boundaries. Bound the section by
+  // the next generated reviewer heading/footer; accept a SHA marker only when
+  // it is actually inside those bounds, never one retained at the comment end.
+  const heading = `## ${reviewer}\n\n`;
+  const start = priorBody.indexOf(heading);
+  if (start < 0) return undefined;
+  const afterHeading = start + heading.length;
+  const nextHeading = priorBody.indexOf("\n\n---\n\n## ", afterHeading);
+  const footer = priorBody.indexOf("\n\n---\n\nUse `@loupe fix`", afterHeading);
+  const combinedMarker = priorBody.indexOf(
+    "\n\n<!-- loupe:summary:combined -->",
+    afterHeading,
+  );
+  const candidates = [nextHeading, footer, combinedMarker].filter(
+    (index) => index >= 0,
+  );
+  const end =
+    candidates.length > 0 ? Math.min(...candidates) : priorBody.length;
+  const section = priorBody.slice(start, end).trim();
   const marker = new RegExp(
     `<!-- loupe:summary:${escaped} sha=[0-9a-f]{7,40} -->`,
-  ).exec(priorBody);
-  if (!marker?.[0] || marker.index === undefined) return undefined;
-  const heading = `## ${reviewer}\n\n`;
-  const start = priorBody.lastIndexOf(heading, marker.index);
-  if (start < 0) return undefined;
-  return priorBody.slice(start, marker.index + marker[0].length);
+  ).exec(section);
+  return marker ? section : undefined;
 }
 
 function preserveSkippedSummarySections(

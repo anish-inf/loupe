@@ -23,7 +23,11 @@ import type { Octokit } from "@octokit/rest";
 import { z } from "zod";
 
 import type { Config } from "./config";
-import { runReviews, type ReviewerOutcome } from "./orchestrate";
+import {
+  CombinedSummaryPublicationError,
+  runReviews,
+  type ReviewerOutcome,
+} from "./orchestrate";
 import { loadReviewers } from "./reviewers";
 
 const MENTION = /@loupe\b/i;
@@ -279,7 +283,9 @@ export async function handleComment(
         octokit,
         ref,
         ackId,
-        `⚠️ Re-review finished, but Loupe could not publish the combined summary — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`,
+        err instanceof CombinedSummaryPublicationError
+          ? `⚠️ Re-review finished, but Loupe could not publish the combined summary — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`
+          : `⚠️ Loupe could not complete the re-review — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`,
       );
     }
     return;

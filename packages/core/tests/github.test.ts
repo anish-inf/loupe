@@ -713,6 +713,29 @@ describe("combined summary", () => {
     expect(body).not.toContain("_Not run:");
   });
 
+  it("does not let a retained marker swallow later reviewer sections", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      issueComments: [
+        {
+          id: 2,
+          body: `# Loupe\n\n---\n\n## code\n\nNo marker in this section\n\n---\n\n## security\n\nSecurity details\n\n<!-- loupe:summary:security sha=${sha} -->\n\n---\n\nUse \`@loupe fix\`\n\n<!-- loupe:summary:code sha=${sha} -->\n\n<!-- loupe:summary:combined -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(
+      api as never,
+      ref,
+      "# Loupe\n\n---\n\n## code\n\n_Not run: No changes._\n\n---\n\nUse `@loupe fix`",
+    );
+    const update = api.issues.updateComment.mock.calls[0] as unknown as [
+      { body: string },
+    ];
+    expect(update[0].body).toContain("_Not run: No changes._");
+    expect(update[0].body).not.toContain("Security details");
+  });
+
   it("marks legacy summaries stale without deleting them", async () => {
     api = octokit({
       issueComments: [
