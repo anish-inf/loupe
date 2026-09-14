@@ -90,6 +90,16 @@ The entrypoint reads only these (parsed in `packages/action/src/config.ts`):
 Comment/chat mode is auto-detected from `GITHUB_EVENT_NAME` (`issue_comment` /
 `pull_request_review_comment`), which the runner sets.
 
+## Review traces in the step summary
+
+After every reviewer finishes, loupe appends a bounded Markdown **review trace**
+to the Actions step summary (`GITHUB_STEP_SUMMARY`) — the reasoning each
+reviewer emitted (collapsed), its tool calls/results, reply text, and final
+result/error. It is automatic (the action already sets `GITHUB_STEP_SUMMARY`),
+offline (no model calls), and writes nothing into the repo. For local
+verification, set `GITHUB_STEP_SUMMARY=/tmp/loupe-summary.md`. See
+[Review traces](review-traces.md).
+
 ## Private-repo action access
 
 To use the private `context-labs/loupe` action from another org repo without

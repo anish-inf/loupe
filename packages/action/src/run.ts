@@ -11,7 +11,11 @@ import {
   resolveCredentials,
   type CredentialProvider,
 } from "@loupe/credentials";
-import { getHarness, type WhipConfig } from "@loupe/harness";
+import {
+  getHarness,
+  type HarnessTraceEvent,
+  type WhipConfig,
+} from "@loupe/harness";
 import type { Logger } from "@loupe/logger";
 
 export type RunInput = {
@@ -43,6 +47,8 @@ export type RunInput = {
   readonly maxTurns?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
+  /** Optional trace sink forwarded to every harness call this review makes. */
+  readonly trace?: (event: HarnessTraceEvent) => void;
   readonly logger: Logger;
 };
 
@@ -104,6 +110,7 @@ export async function reviewPullRequest(
     maxTurns: input.maxTurns,
     priorComments: input.priorComments,
     procedure: input.procedure,
+    trace: input.trace,
     logger,
   });
 }
