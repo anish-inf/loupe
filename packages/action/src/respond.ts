@@ -280,6 +280,11 @@ export async function handleComment(
   const fixMatch = /^fix\b[:\s]*(.*)/is.exec(instruction);
   if (fixMatch) {
     logger.info("Chat command: fix");
+    const ackId = await postIssueComment(
+      octokit,
+      ref,
+      "🔧 Got it — preparing the fix and collecting the current findings.",
+    );
     try {
       const requested = fixMatch[1]?.trim() ?? "";
       let findings: readonly OpenLoupeFinding[] | undefined;
@@ -303,20 +308,22 @@ export async function handleComment(
           new Set(configured),
         );
         if (findings.length === 0) {
-          await postIssueComment(
+          await updateIssueComment(
             octokit,
             ref,
+            ackId,
             "✅ There are no open Loupe findings for the current PR head.",
           );
           return;
         }
       }
-      await postIssueComment(
+      await updateIssueComment(
         octokit,
         ref,
+        ackId,
         findings
-          ? `🔧 On it — working on ${findings.length} open finding${findings.length === 1 ? "" : "s"}.`
-          : "🔧 On it — working on a fix.",
+          ? `🔧 Fixing ${findings.length} open finding${findings.length === 1 ? "" : "s"} from ${new Set(findings.map((finding) => finding.reviewer)).size} reviewer${new Set(findings.map((finding) => finding.reviewer)).size === 1 ? "" : "s"}. I’ll update this PR when the commit is pushed.`
+          : "🔧 Working on the requested change now. I’ll update this PR when the commit is pushed.",
       );
       await runFix(
         config,
@@ -328,7 +335,14 @@ export async function handleComment(
         findingsHead,
       );
     } catch (err) {
-      await postFailure(octokit, ref, "fix", err, logger);
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.error("Chat command failed: fix", { error: reason });
+      await updateIssueComment(
+        octokit,
+        ref,
+        ackId,
+        `⚠️ I couldn't complete the fix — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`,
+      );
     }
     return;
   }
