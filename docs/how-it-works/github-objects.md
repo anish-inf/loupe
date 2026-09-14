@@ -70,7 +70,10 @@ Severity emoji: 🔴 blocker, 🟡 warning, 🔵 nit.
 <summary from the agent>
 
 #### Concerns
-- 🟡 **title** — detail
+
+🟡 **title**
+
+<detail>
 
 #### Highlights
 - ✅ ...
@@ -90,7 +93,7 @@ Last reviewed commit: [`abc1234`](link)
 <!-- loupe:summary:<reviewer> sha=<head> -->
 ~~~
 
-In ensemble mode, minority findings sit in a second `<details>` block titled "Lower-confidence findings".
+In ensemble mode, minority findings sit in a second `<details>` block titled "Lower-confidence findings (raised by a minority of models)".
 
 ## Author guard
 
