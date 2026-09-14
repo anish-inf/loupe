@@ -138,6 +138,30 @@ describe("renderTraceSection", () => {
     );
   });
 
+  it("retains an error after truncating a large phase", () => {
+    const events: HarnessTraceEvent[] = [
+      ...Array.from({ length: 12 }, (_, i) => [
+        { type: "tool_start", name: "read", args: `file-${i}` },
+        { type: "tool_end", name: "read", result: "x".repeat(4000) },
+      ]).flat(),
+      { type: "error", error: "fatal review failure" },
+    ] as HarnessTraceEvent[];
+    const md = renderTraceSection("failed", events);
+    expect(md).toContain("Phase truncated at a complete block");
+    expect(md).toContain("This phase failed");
+    expect(md).toContain("fatal review failure");
+  });
+
+  it("retains the incomplete-stream note after truncation", () => {
+    const events: HarnessTraceEvent[] = Array.from({ length: 12 }, (_, i) => [
+      { type: "tool_start", name: "read", args: `file-${i}` },
+      { type: "tool_end", name: "read", result: "x".repeat(4000) },
+    ]).flat() as HarnessTraceEvent[];
+    const md = renderTraceSection("partial", events);
+    expect(md).toContain("Phase truncated at a complete block");
+    expect(md).toContain("without a terminal event");
+  });
+
   it("marks a partial stream without a terminal event", () => {
     const md = renderTraceSection("x", [
       { type: "reasoning", delta: "still working" },

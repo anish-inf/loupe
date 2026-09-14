@@ -161,16 +161,29 @@ function renderPhase(phase: PhaseTrace): string {
       : undefined,
   ].filter(Boolean);
   const out = [`#### ${status} ${phaseTitle(phase)}`, stats.join(" · ")];
+  const terminal =
+    outcome?.status === "error"
+      ? `> [!WARNING]\n> This phase failed.\n\n${code(outcome.text)}`
+      : !outcome
+        ? "> [!NOTE]\n> This phase ended without a terminal event. See the job log for details."
+        : undefined;
+  const reserved = terminal ? terminal.length + 2 : 0;
+  let truncated = false;
 
   const pushBlock = (block: string): boolean => {
-    if ([...out, block].join("\n\n").length > PHASE_MAX_CHARS) {
+    if ([...out, block].join("\n\n").length + reserved > PHASE_MAX_CHARS) {
       out.push(
         "> [!NOTE]\n> Phase truncated at a complete block. Additional detail remains in the job log.",
       );
+      truncated = true;
       return false;
     }
     out.push(block);
     return true;
+  };
+  const finish = (): string => {
+    if (terminal) out.push(terminal);
+    return out.filter(Boolean).join("\n\n");
   };
 
   if (
@@ -179,7 +192,7 @@ function renderPhase(phase: PhaseTrace): string {
       `<details>\n<summary><strong>🧠 Thinking</strong> · ${reasoning.length.toLocaleString()} chars</summary>\n\n${code(reasoning, "text", REASONING_CHARS)}\n\n</details>`,
     )
   ) {
-    return out.filter(Boolean).join("\n\n");
+    return finish();
   }
 
   if (tools.length) {
@@ -199,7 +212,7 @@ function renderPhase(phase: PhaseTrace): string {
           `<details>\n<summary>${summary}</summary>\n\n${body}\n\n</details>`,
         )
       ) {
-        return out.filter(Boolean).join("\n\n");
+        return finish();
       }
     }
   }
@@ -212,17 +225,12 @@ function renderPhase(phase: PhaseTrace): string {
       `<details>\n<summary><strong>📝 Output</strong> · ${final.length.toLocaleString()} chars</summary>\n\n${code(final, "json")}\n\n</details>`,
     )
   ) {
-    return out.filter(Boolean).join("\n\n");
+    return finish();
   }
 
-  if (outcome?.status === "error") {
-    out.push(`> [!WARNING]\n> This phase failed.\n\n${code(outcome.text)}`);
-  } else if (!outcome) {
-    out.push(
-      "> [!NOTE]\n> This phase ended without a terminal event. See the job log for details.",
-    );
-  }
-
+  // Successful phases need no terminal callout; failures and incomplete streams
+  // always retain theirs, even when earlier detail hit the phase cap.
+  if (!truncated || terminal) return finish();
   return out.filter(Boolean).join("\n\n");
 }
 
