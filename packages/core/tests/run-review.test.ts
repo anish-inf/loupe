@@ -8,7 +8,11 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { Harness, HarnessContext } from "@loupe/harness";
+import type {
+  Harness,
+  HarnessContext,
+  HarnessTraceEvent,
+} from "@loupe/harness";
 import { describe, expect, it, vi } from "vitest";
 
 import { runReview, type ReviewRequest } from "../src/index";
@@ -172,14 +176,44 @@ function fakeHarness(script: {
     available: async () => true,
     review: async (ctx) => {
       contexts.push(ctx);
-      if (ctx.systemPrompt.startsWith("You are a strict reviewer verifying")) {
-        return script.verify ?? "";
+      const verifying = ctx.systemPrompt.startsWith(
+        "You are a strict reviewer verifying",
+      );
+      ctx.trace?.({
+        type: "reasoning",
+        delta: verifying ? "verify evidence" : "inspect change",
+        model: ctx.model,
+        phase: ctx.phase,
+      });
+      if (verifying) {
+        const output = script.verify ?? "";
+        ctx.trace?.({
+          type: "done",
+          text: output,
+          model: ctx.model,
+          phase: ctx.phase,
+        });
+        return output;
       }
-      if (ctx.agentic) {
-        if (script.agentic instanceof Error) throw script.agentic;
-        return script.agentic;
+      if (ctx.agentic && script.agentic instanceof Error) {
+        ctx.trace?.({
+          type: "error",
+          error: script.agentic.message,
+          model: ctx.model,
+          phase: ctx.phase,
+        });
+        throw script.agentic;
       }
-      return script.headless ?? "";
+      const output = ctx.agentic
+        ? (script.agentic as string)
+        : (script.headless ?? "");
+      ctx.trace?.({
+        type: "done",
+        text: output,
+        model: ctx.model,
+        phase: ctx.phase,
+      });
+      return output;
     },
   };
   return { harness, contexts };
@@ -336,6 +370,83 @@ describe("runReview end to end", () => {
     );
     expect(api.issues.createComment.mock.calls[0]![0]!.body).toContain(
       "headless fallback",
+    );
+  });
+
+  it("tags primary and verification trace events", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "check me" },
+      ]),
+      verify: verifyAll(1),
+    });
+    const events: HarnessTraceEvent[] = [];
+
+    await runReview(
+      request(api, harness, checkout(), {
+        model: "trace-model",
+        trace: (event) => events.push(event),
+      }),
+    );
+
+    expect(events.map((event) => `${event.phase}:${event.type}`)).toEqual([
+      "primary:trace-model:reasoning",
+      "primary:trace-model:done",
+      "verify:trace-model:reasoning",
+      "verify:trace-model:done",
+    ]);
+  });
+
+  it("retains the failed primary trace before a successful fallback", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: new Error("primary exploded"),
+      headless: reviewJson([]),
+    });
+    const events: HarnessTraceEvent[] = [];
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        model: "trace-model",
+        trace: (event) => events.push(event),
+      }),
+    );
+
+    expect(result.diagnostics.mode).toBe("fallback");
+    expect(events.map((event) => `${event.phase}:${event.type}`)).toEqual([
+      "primary:trace-model:reasoning",
+      "primary:trace-model:error",
+      "fallback:trace-model:reasoning",
+      "fallback:trace-model:done",
+    ]);
+    expect(
+      events.find(
+        (event) => event.type === "error" && event.phase?.startsWith("primary"),
+      ),
+    ).toEqual(expect.objectContaining({ error: "primary exploded" }));
+  });
+
+  it("tags every ensemble model independently and skips verification", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({ agentic: reviewJson([]) });
+    const events: HarnessTraceEvent[] = [];
+
+    await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+        trace: (event) => events.push(event),
+      }),
+    );
+
+    expect(events.map((event) => `${event.phase}:${event.type}`)).toEqual([
+      "ensemble:model-a:reasoning",
+      "ensemble:model-a:done",
+      "ensemble:model-b:reasoning",
+      "ensemble:model-b:done",
+    ]);
+    expect(events.some((event) => event.phase?.startsWith("verify"))).toBe(
+      false,
     );
   });
 

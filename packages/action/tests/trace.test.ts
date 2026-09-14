@@ -94,6 +94,31 @@ describe("renderTraceSection", () => {
     expect(md).toContain("&lt;/details&gt;&lt;script&gt;");
   });
 
+  it("pairs repeated tools in order and handles orphaned tool events", () => {
+    const md = renderTraceSection("x", [
+      { type: "tool_start", name: "read", args: "first" },
+      { type: "tool_start", name: "read", args: "second" },
+      { type: "tool_end", name: "read", result: "second result" },
+      { type: "tool_end", name: "read", result: "first result" },
+      { type: "tool_end", name: "grep", result: "orphan result" },
+      { type: "tool_start", name: "bash", args: "unfinished" },
+      { type: "done", text: "ok" },
+    ] as HarnessTraceEvent[]);
+    expect(md).toContain("second result");
+    expect(md).toContain("first result");
+    expect(md).toContain("orphan result");
+    expect(md).toContain("_No result was captured._");
+    expect(md.match(/<summary>\d+\. <code>/g)).toHaveLength(4);
+  });
+
+  it("marks a partial stream without a terminal event", () => {
+    const md = renderTraceSection("x", [
+      { type: "reasoning", delta: "still working" },
+    ] as HarnessTraceEvent[]);
+    expect(md).toContain("### ➖ x");
+    expect(md).toContain("without a terminal event");
+  });
+
   it("surfaces errors as a warning callout", () => {
     const md = renderTraceSection("x", [
       { type: "error", error: "exit 1: boom" },
@@ -136,9 +161,9 @@ describe("renderReviewsTrace", () => {
       { type: "reasoning", delta: "y".repeat(40000) },
       { type: "done", text: "ok" },
     ];
-    expect(
-      renderReviewsTrace([{ reviewer: "huge", events: huge }]).length,
-    ).toBeLessThan(100000);
+    const bounded = renderReviewsTrace([{ reviewer: "huge", events: huge }]);
+    expect(bounded.length).toBeLessThan(100000);
+    expect(bounded).toContain("truncated (40,000 characters total)");
   });
 });
 
@@ -170,6 +195,14 @@ describe("writeReviewsTraceToSummary", () => {
     expect(output).toContain("preexisting");
     expect(output).toContain("## 🔎 Loupe trace");
     expect(output).toContain("### ✅ code");
+  });
+
+  it("throws for an unwritable summary path so orchestration can warn", () => {
+    expect(() =>
+      writeReviewsTraceToSummary([{ reviewer: "code", events: sample() }], {
+        GITHUB_STEP_SUMMARY: tmpdir(),
+      } as NodeJS.ProcessEnv),
+    ).toThrow();
   });
 
   it("is a no-op without a summary path or traces", () => {

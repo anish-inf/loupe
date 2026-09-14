@@ -38,6 +38,36 @@ describe("whipEventToTrace (nondestructive normalization)", () => {
     ]);
   });
 
+  it("serializes structured tool results", () => {
+    expect(
+      whipEventToTrace({
+        type: "tool_end",
+        name: "read",
+        result: { lines: ["one", "two"], truncated: false },
+      }),
+    ).toEqual([
+      {
+        type: "tool_end",
+        name: "read",
+        result: '{"lines":["one","two"],"truncated":false}',
+      },
+    ]);
+  });
+
+  it("handles circular tool payloads without throwing", () => {
+    const circular: Record<string, unknown> = {};
+    circular["self"] = circular;
+    expect(
+      whipEventToTrace({ type: "tool_start", name: "custom", args: circular }),
+    ).toEqual([
+      {
+        type: "tool_start",
+        name: "custom",
+        args: "[unserializable tool payload]",
+      },
+    ]);
+  });
+
   it("defaults a missing tool name and serializes structured args", () => {
     expect(whipEventToTrace({ type: "tool_start" })).toEqual([
       { type: "tool_start", name: "tool", args: undefined },
