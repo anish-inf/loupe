@@ -1,12 +1,12 @@
 # Triggers
 
 
-Two workflows, one action. They are separate files so neither shows as a perpetually skipped job on the other's events. loupe ships templates for both in its `examples/` and `.github/workflows/` directories.
+Two workflows, one action. They are separate files so neither shows as a perpetually skipped job on the other's events. loupe ships templates for both in `.github/workflows/`; `examples/` also contains a review workflow template.
 
 | Workflow | Event | Runs when | Permissions |
 | --- | --- | --- | --- |
-| review | `pull_request`: opened, synchronize, reopened, ready_for_review | PR is not a draft, optionally filtered by `paths` | `pull-requests: write`, `contents: read` |
-| chat | `issue_comment`, `pull_request_review_comment` (created) | Comment is on a PR and contains `@loupe` | `pull-requests: write`, `contents: write` (for `@loupe fix`) |
+| review | `pull_request`: opened, synchronize, reopened, ready_for_review | PR is not a draft, its branch belongs to this repository, and any optional `paths` filter matches | `id-token: write`, `pull-requests: write`, `contents: read` |
+| chat | `issue_comment`, `pull_request_review_comment` (created) | Comment is on a PR, contains `@loupe`, and its author is an owner, member, or collaborator | `id-token: write`, `pull-requests: write`, `contents: write` (for `@loupe fix`) |
 
 ## Decision flow
 
@@ -15,7 +15,9 @@ flowchart TD
     E[GitHub event] --> T{Event type}
     T -->|pull_request| D{Draft?}
     D -->|yes| S1[Skip]
-    D -->|no| P{"Matches paths filter?"}
+    D -->|no| SR{Same-repo branch?}
+    SR -->|no| S1
+    SR -->|yes| P{"Optional paths filter matches?"}
     P -->|no| S1
     P -->|yes| C1[Cancel in-flight review for this PR]
     C1 --> R[Review job]
@@ -23,7 +25,9 @@ flowchart TD
     ISPR -->|no| S1
     ISPR -->|yes| M{Body contains @loupe?}
     M -->|no| S1
-    M -->|yes| Q[Queue behind any running chat job for this PR]
+    M -->|yes| A{Owner, member, or collaborator?}
+    A -->|no| S1
+    A -->|yes| Q[Queue behind any running chat job for this PR]
     Q --> CH[Chat job]
 ```
 
@@ -34,7 +38,7 @@ flowchart TD
 
 ## Job setup (both workflows)
 
-1. `actions/checkout` at the PR merge ref. The agent's tools read this checkout.
+1. `actions/checkout`. The review workflow lands on the PR merge ref. A comment-triggered chat workflow starts from the default branch; `@loupe fix` fetches and checks out the PR head branch before the agent edits it.
 2. Install the harness CLI (`whip`, `claude`, or `codex`).
 3. Provide the model provider's API key as an environment variable. Where it comes from (repo secret, Infisical, Vault) is the workflow's business, not loupe's.
 4. `uses: context-labs/loupe@main` with `config: <path to .loupe.json>`.

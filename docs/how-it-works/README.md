@@ -16,16 +16,26 @@ Source: [context-labs/loupe](https://github.com/context-labs/loupe). loupe revie
 
 ## 30-second picture
 
+This is the map for the pages below. The numbered review path is the main story; chat branches from the same action.
+
 ```mermaid
 flowchart LR
-    PR[PR event or @loupe comment] --> WF[GitHub Actions workflow]
-    WF --> A[loupe action]
-    A -->|REST| GH[(GitHub API)]
-    A -->|spawn| W[agent CLI]
-    W -->|tools| CO[repo checkout]
-    W -->|completions| LLM[model provider]
-    A -->|review + comments| GH
+    E["1 · GitHub event"] --> A["2 · loupe action"]
+    A --> R["3 · Scope and review"]
+    R --> C["4 · Build agent context"]
+    C --> P["5 · Post GitHub objects"]
+    P -. "next push" .-> R
+    A -->|"@loupe"| H["6 · Chat command"]
 ```
+
+The detailed diagrams follow this same path rather than repeating the whole system:
+
+1. [Triggers](./triggers.md) selects **events**.
+2. [A review run](./review-run.md) owns **scope, agent execution, and filtering**.
+3. [What the agent sees](./context.md) describes the **review input**.
+4. [GitHub objects](./github-objects.md) explains **what gets posted**.
+5. [First run vs later runs](./first-vs-incremental.md) explains the dotted **next-push loop**.
+6. [@loupe chat](./chat.md) covers the separate **comment-command branch**.
 
 - **One job per PR event.** The recommended workflow groups concurrency by PR number so a new push cancels the in-flight review.
 - **Reviewers run in parallel** inside that job. Each one scopes to its globs, runs its own agent, and posts its own review and summary comment.

@@ -24,44 +24,17 @@ flowchart TD
 
 The "sha equals head" case happens on `reopened` or `ready_for_review` with no new commits, and on a manual re-run. Treating it as a full run means the review is recomputed and replaced, not skipped.
 
-## First run
+## Example: first run, then a push
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant GH as GitHub
-    participant L as loupe (one reviewer)
-    participant W as agent
-    GH->>L: pull_request opened, head = A
-    L->>GH: listComments, listReviews
-    Note over L: no markers → full run over all in-scope files
-    L->>W: review 12 files
-    W-->>L: 3 findings
-    L->>GH: createReview COMMENT + 3 inline (marker sha=A)
-    L->>GH: createComment summary (marker summary sha=A)
-```
+| | First run at SHA A | Later push at SHA B |
+| --- | --- | --- |
+| Marker found | No | Yes, SHA A |
+| Files assessed | All 12 in scope | 2 changed since A |
+| Diff context | All 12 patches | All 12 patches |
+| Prior threads touched | None | Only threads on those 2 files |
+| Summary marker after run | SHA A | SHA B |
 
-## Second push
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant GH as GitHub
-    participant L as loupe (one reviewer)
-    participant W as agent
-    GH->>L: pull_request synchronize, head = B
-    L->>GH: listComments → summary marker sha=A
-    L->>GH: compareCommits A..B → 2 files changed
-    Note over L: incremental: reassess those 2 files, all 12 patches on disk as context
-    L->>W: review 2 files (12 in the tree)
-    W-->>L: 1 finding
-    L->>GH: snapshot my threads on those 2 files only
-    L->>GH: createReview COMMENT + 1 inline (marker sha=B)
-    L->>GH: updateComment summary (stats for 2 files, marker sha=B)
-    L->>GH: resolveReviewThread for each snapshotted thread
-```
-
-Threads on the other 10 files from the first run are untouched. A finding the agent anchors on one of those files is dropped and counted, so it cannot duplicate a kept thread. GitHub shows old threads as outdated if their lines moved.
+This is the **next push** loop from the [overview](./README.md#30-second-picture): the summary marker sends the next review back through scope selection without discarding findings on untouched files.
 
 ## Push that changes nothing in scope
 
