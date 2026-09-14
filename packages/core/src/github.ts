@@ -362,7 +362,11 @@ export async function listOpenLoupeFindings(
     for (const thread of conn.nodes) {
       if (!thread || thread.isResolved) continue;
       const root = thread.comments.nodes[0];
-      if (!root || root.replyTo || root.author?.login !== self) continue;
+      const rootAuthor = root?.author?.login;
+      const authoredBySelf =
+        rootAuthor === self ||
+        (self === "github-actions[bot]" && rootAuthor === "github-actions");
+      if (!root || root.replyTo || !authoredBySelf) continue;
       const marker = parseFindingMarker(root.body);
       if (!marker || marker.sha !== headSha) continue;
       if (reviewers && !reviewers.has(marker.reviewer)) continue;
