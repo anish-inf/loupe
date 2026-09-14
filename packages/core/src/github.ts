@@ -728,7 +728,25 @@ function preserveSkippedSummarySections(
   priorBody?: string,
 ): string {
   if (!priorBody) return body;
-  return body.replace(
+
+  // New combined summaries have explicit structural boundaries. Replace only
+  // the content inside a skipped reviewer's own pair and retain the new pair.
+  const marked = body.replace(
+    /<!-- loupe:section:([^\s]+):start -->\n([\s\S]*?)\n<!-- loupe:section:\1:end -->/g,
+    (section, reviewer: string, content: string) => {
+      if (!/^## [^\n]+\n\n_Not run: [^\n]*_$/s.test(content.trim())) {
+        return section;
+      }
+      const priorSection = priorReviewerSection(priorBody, reviewer);
+      return priorSection
+        ? `<!-- loupe:section:${reviewer}:start -->\n${priorSection}\n\n> ℹ️ Not updated in this run.\n<!-- loupe:section:${reviewer}:end -->`
+        : section;
+    },
+  );
+
+  // Backward compatibility for callers/new bodies created before section
+  // boundaries were introduced.
+  return marked.replace(
     /## ([^\n]+)\n\n_Not run: [^\n]*_(?=\n\n---|$)/g,
     (stub, reviewer: string) => {
       const priorSection = priorReviewerSection(priorBody, reviewer);

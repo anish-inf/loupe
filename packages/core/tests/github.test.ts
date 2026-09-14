@@ -713,6 +713,34 @@ describe("combined summary", () => {
     expect(body).not.toContain("_Not run:");
   });
 
+  it("restores a marked skipped section inside exactly one boundary pair", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      issueComments: [
+        {
+          id: 2,
+          body: `# Loupe\n\n---\n\n<!-- loupe:section:code:start -->\n## code\n\nPrevious findings\n\n<!-- loupe:summary:code sha=${sha} -->\n<!-- loupe:section:code:end -->\n\n---\n\n<!-- loupe:section:security:start -->\n## security\n\nSecurity details\n\n<!-- loupe:summary:security sha=${sha} -->\n<!-- loupe:section:security:end -->\n\n---\n\nUse \`@loupe fix\`\n\n<!-- loupe:summary:combined -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(
+      api as never,
+      ref,
+      `# Loupe\n\n---\n\n<!-- loupe:section:code:start -->\n## code\n\n_Not run: No changes._\n<!-- loupe:section:code:end -->\n\n---\n\n<!-- loupe:section:security:start -->\n## security\n\nNew security result\n\n<!-- loupe:summary:security sha=${sha} -->\n<!-- loupe:section:security:end -->\n\n---\n\nUse \`@loupe fix\``,
+    );
+    const update = api.issues.updateComment.mock.calls[0] as unknown as [
+      { body: string },
+    ];
+    const updated = update[0].body;
+    expect(updated).toContain("Previous findings");
+    expect(updated).toContain("New security result");
+    expect(updated).not.toContain("Security details");
+    expect(updated.match(/loupe:section:code:start/g)).toHaveLength(1);
+    expect(updated.match(/loupe:section:code:end/g)).toHaveLength(1);
+    expect(updated).not.toContain("_Not run: No changes._");
+  });
+
   it("does not let a retained marker swallow later reviewer sections", async () => {
     const sha = "a".repeat(40);
     api = octokit({
