@@ -13,27 +13,14 @@ Three kinds of object, all owned by loupe's TypeScript, never by the agent.
 
 ## The posting sequence
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant L as loupe
-    participant GH as GitHub API
-    L->>GH: users.getAuthenticated
-    Note over L,GH: Actions token cannot, so it falls back to github-actions[bot]
-    L->>GH: snapshot prior threads (GraphQL reviewThreads) or comments (listReviewComments)
-    alt inline findings or a blocker concern
-        L->>GH: pulls.createReview(event, body, comments[])
-    end
-    L->>GH: issues.listComments
-    alt summary comment by me exists
-        L->>GH: issues.updateComment
-    else
-        L->>GH: issues.createComment
-    end
-    loop each snapshotted prior thread or comment
-        L->>GH: resolveReviewThread, or pulls.deleteReviewComment
-    end
-```
+This page expands the **Post review and summary** box in [A review run](./review-run.md#pipeline). For each reviewer, loupe:
+
+1. snapshots eligible prior threads;
+2. creates a review only when inline findings or a blocker require one;
+3. creates or updates the reviewer's single summary comment; and
+4. resolves, deletes, or keeps the snapshotted threads according to `priorComments`.
+
+Posting happens before cleanup, so a failed post leaves prior comments intact.
 
 ## Review verdict
 

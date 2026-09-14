@@ -6,34 +6,14 @@
 ## Pipeline
 
 ```mermaid
-flowchart TD
-    A[Fetch PR + changed files + convention docs] --> B[Scope: dir, include, exclude]
-    B -->|0 files| Z1[Return: nothing to review]
-    B --> C{full run?}
-    C -->|no| D[Read last-reviewed SHA from markers]
-    D -->|lookup failed| U[Full review, clean up nothing]
-    D -->|found and differs from head| E[Compare SHAs, reassess only files in delta]
-    E -->|0 files| Z2[Return: keep prior comments]
-    E -->|compare failed or 300-file cap| U
-    D -->|none or equals head| F
-    C -->|yes| F[Reassess all in scope]
-    E --> F
-    U --> F
-    F --> G[Build prompts: agentic writes whole in-scope diff to temp file; headless inlines reassessed diff]
-    G --> H[Agent run, maxTurns cap]
-    H -->|agentic error or unparseable output| H2[Retry one-shot from inline diff]
-    H --> I[Parse: needs a string summary; findings or concerns may be absent]
-    H2 --> I
-    I --> I2[Drop findings outside the reassessed files]
-    I2 --> J[Anchor findings to diff lines, snap within 10]
-    J --> K[Drop severities outside profile]
-    K --> ENS{ensemble with at least 2 models?}
-    ENS -->|yes| ENS2[Run the other models, keep majority findings, rest as lower-confidence]
-    ENS -->|no| V{verify on and findings > 0?}
-    V -->|yes| L[Verify pass: one-shot second opinion]
-    V -->|no| M
-    ENS2 --> M
-    L --> M[Post review + summary + run details]
+flowchart LR
+    A[Fetch and scope PR files] --> B[Choose full or incremental scope]
+    B --> C{Files to assess?}
+    C -->|no| X[Stop; preserve prior comments]
+    C -->|yes| D[Build context and run agent]
+    D --> E[Parse, anchor, and filter findings]
+    E --> F[Verify or reach ensemble consensus]
+    F --> G[Post review and summary]
 ```
 
 ## Step by step
@@ -60,33 +40,6 @@ flowchart TD
 
 Hitting `maxTurns` mid-exploration is an error from the harness, which triggers the headless retry.
 
-## Sequence, single reviewer, happy path
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant L as loupe core
-    participant GH as GitHub API
-    participant W as agent CLI
-    participant FS as checkout + /tmp
-
-    L->>GH: pulls.get, pulls.listFiles, repos.getContent per convention doc
-    L->>GH: issues.listComments (find last-reviewed SHA)
-    L->>GH: repos.compareCommits(prior, head)
-    L->>FS: write /tmp/loupe-diff-*/pr.diff
-    L->>W: spawn agent (system prompt, user prompt)
-    loop up to maxTurns
-        W->>FS: read files, grep diff
-    end
-    W-->>L: stdout with JSON review
-    L->>W: spawn agent (verify prompt, headless)
-    W-->>L: verdicts JSON
-    L->>GH: GraphQL reviewThreads — snapshot my prior threads on reassessed files
-    L->>GH: pulls.createReview (inline comments)
-    L->>GH: issues.updateComment or issues.createComment (summary)
-    loop each snapshotted thread
-        L->>GH: GraphQL resolveReviewThread
-    end
-```
+The pipeline hands its result to [GitHub objects](./github-objects.md), which defines the review, summary, and cleanup behavior.
 
 Next: [What the agent sees](./context.md).

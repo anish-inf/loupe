@@ -31,50 +31,19 @@ Same pipeline as a push, with `full` forced. See [First run vs later runs](./fir
 
 ## `@loupe <question>`
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as commenter
-    participant L as loupe
-    participant GH as GitHub API
-    participant W as agent
-    U->>GH: "@loupe is the retry loop safe?"
-    GH->>L: issue_comment event
-    L->>GH: pulls.get, pulls.listFiles
-    L->>W: headless, chat system prompt + question + full inline diff
-    W-->>L: prose answer
-    L->>GH: issues.createComment(answer)
-```
+The chat job fetches the PR and its changed files, then makes one headless agent call with the question and full inline diff. The prose answer is posted as a top-level issue comment.
 
 Headless: no tools, no checkout access, whole PR diff inlined regardless of reviewer globs. No reviewer guidance, skills, or conventions are included. The answer is prose, not JSON.
 
 ## `@loupe fix <what>`
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant L as loupe
-    participant GH as GitHub API
-    participant G as git in checkout
-    participant W as agent
-    L->>GH: issues.createComment("🔧 On it")
-    L->>GH: pulls.get
-    alt head repo is a fork
-        L->>GH: comment "can't push to a fork"
-    else
-        L->>G: fetch origin <head>, then checkout -B <head> FETCH_HEAD
-        L->>GH: pulls.listFiles
-        L->>W: agentic, fix prompt + instruction + changed-file list
-        W->>G: edit files
-        L->>G: status --porcelain
-        alt no changes
-            L->>GH: comment "didn't make any changes"
-        else
-            L->>G: commit as loupe, push HEAD:<head> with token
-            L->>GH: comment "✅ Pushed <sha>. Re-review with @loupe review"
-        end
-    end
-```
+The fix path is longer because it can write to the branch:
+
+1. Post a “🔧 On it” acknowledgement and fetch the PR.
+2. Refuse forked PRs, which the Actions token cannot push to.
+3. Check out the PR head, give the agent the instruction and changed-file list, and let it edit the checkout.
+4. If files changed, commit as loupe and push to the head branch; otherwise report that no changes were made.
+5. Ask the user to run `@loupe review`. The token-authored push does not trigger the review workflow.
 
 - Commit message: `loupe: <first 60 chars of instruction>`. Author `loupe <loupe@users.noreply.github.com>`.
 - The push does **not** trigger a new review run. Pushes made with the Actions token do not fire `pull_request` workflows. Ask for `@loupe review` after.

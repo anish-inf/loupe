@@ -5,34 +5,13 @@ The agent gets two messages and a working directory. Nothing else. It has no Git
 
 ## Layout
 
-```mermaid
-flowchart LR
-    subgraph SYS["System prompt: stable per reviewer, prompt-cached"]
-        direction TB
-        G[Reviewer guidance: prompt or promptFile]
-        PR[Review procedure: check callers first, always on]
-        SK[Skills: SKILL.md bodies]
-        CV[Convention docs: CLAUDE.md, AGENTS.md, ...]
-        RN[Reasoning note: low / medium / high]
-        PD[Profile directive: quiet / chill / assertive]
-        AD[Tool directive: agentic or headless]
-        OC[Output contract: one JSON object]
-    end
-    subgraph USR["User message: per PR"]
-        direction TB
-        ENV[Environment line: date and time]
-        CW[cwd note: how repo-relative paths map onto dir]
-        TI[PR title and description]
-        PI[pathInstructions matching reassessed files]
-        FO[Files to reassess, on an incremental run]
-        CS[Call sites of changed exports, three hops, with context]
-        TR[Tree of all in-scope PR files and path to pr.diff]
-    end
-    subgraph CWD["Working directory"]
-        CO[checkout, scoped to dir if set]
-        DF["/tmp/loupe-diff-*/pr.diff"]
-    end
-```
+This page expands the **Build context and run agent** box in [A review run](./review-run.md#pipeline).
+
+| Input | Changes per | Contains |
+| --- | --- | --- |
+| System prompt | reviewer | Guidance, review procedure, skills, conventions, reasoning/profile/tool directives, and the JSON output contract |
+| User message | PR or push | PR description, path instructions, reassessment scope, call sites, file tree, and diff location or inline diff |
+| Working directory | run | Scoped checkout plus the generated `pr.diff` file |
 
 ## System prompt, in order
 
