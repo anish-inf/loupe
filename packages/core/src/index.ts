@@ -138,6 +138,8 @@ export type ReviewRequest = {
   readonly priorComments?: PriorComments;
   /** Append the always-on review procedure to the system prompt (default true). */
   readonly procedure?: boolean;
+  /** Post inline findings now, but let the caller aggregate the summary. */
+  readonly deferSummary?: boolean;
   /**
    * Optional trace sink forwarded to every harness call this review makes
    * (its primary run, one-shot fallback, each ensemble model, and the
@@ -155,6 +157,10 @@ export type ReviewResult = {
   readonly inline: readonly Finding[];
   readonly dropped: readonly Finding[];
   readonly diagnostics: ReviewDiagnostics;
+  /** Rich per-reviewer Markdown used by the action's combined summary. */
+  readonly summaryBody?: string;
+  /** Present only when this run actually reviewed and published the PR head. */
+  readonly reviewedHeadSha?: string;
 };
 
 const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
@@ -575,14 +581,23 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     return result;
   }
 
-  await postReview(octokit, req.ref, reviewForPost, inline, dropped, logger, {
-    reviewerName: req.reviewerName,
-    headSha: pull.headSha,
-    refreshPaths,
-    fileCount: files.length,
-    priorComments: req.priorComments,
-    diagnostics,
-  });
+  const summaryBody = await postReview(
+    octokit,
+    req.ref,
+    reviewForPost,
+    inline,
+    dropped,
+    logger,
+    {
+      reviewerName: req.reviewerName,
+      headSha: pull.headSha,
+      refreshPaths,
+      fileCount: files.length,
+      priorComments: req.priorComments,
+      diagnostics,
+      deferSummary: req.deferSummary,
+    },
+  );
   logger.info("Posted review", {
     reviewer: req.reviewerName ?? "default",
     inline: inline.length,
@@ -591,7 +606,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     diagnostics,
   });
 
-  return result;
+  return { ...result, summaryBody, reviewedHeadSha: pull.headSha };
 }
 
 /**

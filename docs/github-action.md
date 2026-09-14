@@ -60,8 +60,9 @@ jobs:
         env: { INFERENCE_API_KEY: ${{ secrets.INFERENCE_API_KEY }} }
 ```
 
-Commands: `@loupe review` (re-review the whole PR), `@loupe fix <what>` (make the
-change and push a commit to the PR branch), `@loupe <question>` (answer grounded
+Commands: `@loupe review` (re-review the whole PR), `@loupe fix` (fix all open
+Loupe findings in one commit), `@loupe fix <what>` (make a specific change and
+push it to the PR branch), `@loupe <question>` (answer grounded
 in the diff), `@loupe help`. loupe auto-detects the comment event and switches to
 chat mode; a comment without `@loupe` is ignored.
 

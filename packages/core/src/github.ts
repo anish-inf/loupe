@@ -229,9 +229,21 @@ export async function fetchConventions(
 function markerPrefix(reviewerName: string | undefined): string {
   return `<!-- loupe:${reviewerName ?? "default"} `;
 }
+
+/** Parse only inline-finding markers, never summary markers. */
+function parseFindingMarker(
+  body: string,
+): { reviewer: string; sha: string } | undefined {
+  const match =
+    /<!-- loupe:(?!summary:)([^\s]+) sha=([0-9a-f]{7,40}) -->\s*$/.exec(body);
+  const reviewer = match?.[1];
+  const sha = match?.[2];
+  return reviewer && sha ? { reviewer, sha } : undefined;
+}
 function summaryMarkerPrefix(reviewerName: string | undefined): string {
   return `<!-- loupe:summary:${reviewerName ?? "default"} `;
 }
+const COMBINED_SUMMARY_MARKER = "<!-- loupe:summary:combined -->";
 function makeMarker(reviewerName: string | undefined, sha: string): string {
   return `${markerPrefix(reviewerName)}sha=${sha} -->`;
 }
@@ -271,6 +283,15 @@ type PriorSnapshot = {
 
 const EMPTY_SNAPSHOT: PriorSnapshot = { commentIds: [], threadIds: [] };
 
+export type OpenLoupeFinding = {
+  readonly reviewer: string;
+  readonly path: string;
+  readonly line?: number;
+  readonly body: string;
+  readonly sha: string;
+  readonly url?: string;
+};
+
 type ReviewThreadsPage = {
   repository: {
     pullRequest: {
@@ -279,11 +300,13 @@ type ReviewThreadsPage = {
         nodes: ReadonlyArray<{
           id: string;
           path: string;
+          line: number | null;
           isResolved: boolean;
           viewerCanResolve: boolean;
           comments: {
             nodes: ReadonlyArray<{
               body: string;
+              url: string;
               author: { login: string } | null;
               replyTo: { id: string } | null;
             } | null>;
@@ -303,16 +326,75 @@ query LoupeReviewThreads($owner: String!, $repo: String!, $number: Int!, $after:
         nodes {
           id
           path
+          line
           isResolved
           viewerCanResolve
           comments(first: 1) {
-            nodes { body author { login } replyTo { id } }
+            nodes { body url author { login } replyTo { id } }
           }
         }
       }
     }
   }
 }`;
+
+/** List unresolved findings across configured reviewers, including findings
+ * retained by incremental reviews from an earlier head. */
+export async function listOpenLoupeFindings(
+  octokit: Octokit,
+  ref: PullRef,
+  _headSha: string,
+  reviewers?: ReadonlySet<string>,
+): Promise<OpenLoupeFinding[]> {
+  const self = await getSelfLogin(octokit);
+  const findings: OpenLoupeFinding[] = [];
+  let after: string | null = null;
+  do {
+    const page: ReviewThreadsPage = await octokit.graphql(
+      REVIEW_THREADS_QUERY,
+      {
+        owner: ref.owner,
+        repo: ref.repo,
+        number: ref.pull_number,
+        after,
+      },
+    );
+    const conn = page.repository.pullRequest.reviewThreads;
+    for (const thread of conn.nodes) {
+      if (!thread || thread.isResolved) continue;
+      const root = thread.comments.nodes[0];
+      const rootAuthor = root?.author?.login;
+      const authoredBySelf =
+        rootAuthor === self ||
+        (self === "github-actions[bot]" && rootAuthor === "github-actions");
+      if (!root || root.replyTo || !authoredBySelf) continue;
+      const marker = parseFindingMarker(root.body);
+      if (!marker) continue;
+      if (reviewers && !reviewers.has(marker.reviewer)) continue;
+      const body = root.body
+        .replace(
+          /\n\n<!-- loupe:(?!summary:)[^\s]+ sha=[0-9a-f]{7,40} -->\s*$/,
+          "",
+        )
+        .trim();
+      findings.push({
+        reviewer: marker.reviewer,
+        path: thread.path,
+        ...(thread.line === null ? {} : { line: thread.line }),
+        body,
+        sha: marker.sha,
+        ...(root.url ? { url: root.url } : {}),
+      });
+    }
+    after = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+  } while (after);
+  return findings.sort(
+    (a, b) =>
+      a.path.localeCompare(b.path) ||
+      (a.line ?? 0) - (b.line ?? 0) ||
+      a.reviewer.localeCompare(b.reviewer),
+  );
+}
 
 const RESOLVE_THREAD_MUTATION = `
 mutation LoupeResolveThread($threadId: ID!) {
@@ -595,7 +677,163 @@ export type PostReviewOptions = {
   readonly priorComments?: PriorComments;
   /** Run diagnostics for the summary; omitted = not rendered. */
   readonly diagnostics?: ReviewDiagnostics;
+  /** Let a higher-level orchestrator publish one summary for all reviewers. */
+  readonly deferSummary?: boolean;
 };
+
+function priorReviewerSection(
+  priorBody: string,
+  reviewer: string,
+): string | undefined {
+  const escaped = reviewer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const startMarker = `<!-- loupe:section:${reviewer}:start -->`;
+  const endMarker = `<!-- loupe:section:${reviewer}:end -->`;
+  const markedStart = priorBody.indexOf(startMarker);
+  if (markedStart >= 0) {
+    const markedEnd = priorBody.indexOf(endMarker, markedStart);
+    if (markedEnd >= 0) {
+      return priorBody
+        .slice(markedStart + startMarker.length + 1, markedEnd)
+        .trim();
+    }
+  }
+
+  // Legacy combined summaries had no section boundaries. Bound the section by
+  // the next generated reviewer heading/footer; accept a SHA marker only when
+  // it is actually inside those bounds, never one retained at the comment end.
+  const heading = `## ${reviewer}\n\n`;
+  const start = priorBody.indexOf(heading);
+  if (start < 0) return undefined;
+  const afterHeading = start + heading.length;
+  const nextHeading = priorBody.indexOf("\n\n---\n\n## ", afterHeading);
+  const footer = priorBody.indexOf("\n\n---\n\nUse `@loupe fix`", afterHeading);
+  const combinedMarker = priorBody.indexOf(
+    "\n\n<!-- loupe:summary:combined -->",
+    afterHeading,
+  );
+  const candidates = [nextHeading, footer, combinedMarker].filter(
+    (index) => index >= 0,
+  );
+  const end =
+    candidates.length > 0 ? Math.min(...candidates) : priorBody.length;
+  const section = priorBody.slice(start, end).trim();
+  const marker = new RegExp(
+    `<!-- loupe:summary:${escaped} sha=[0-9a-f]{7,40} -->`,
+  ).exec(section);
+  return marker ? section : undefined;
+}
+
+function preserveSkippedSummarySections(
+  body: string,
+  priorBody?: string,
+): string {
+  if (!priorBody) return body;
+
+  // New combined summaries have explicit structural boundaries. Replace only
+  // the content inside a skipped reviewer's own pair and retain the new pair.
+  const marked = body.replace(
+    /<!-- loupe:section:([^\s]+):start -->\n([\s\S]*?)\n<!-- loupe:section:\1:end -->/g,
+    (section, reviewer: string, content: string) => {
+      if (!/^## [^\n]+\n\n_Not run: [^\n]*_$/s.test(content.trim())) {
+        return section;
+      }
+      const priorSection = priorReviewerSection(priorBody, reviewer);
+      return priorSection
+        ? `<!-- loupe:section:${reviewer}:start -->\n${priorSection}\n\n> ℹ️ Not updated in this run.\n<!-- loupe:section:${reviewer}:end -->`
+        : section;
+    },
+  );
+
+  // Backward compatibility for callers/new bodies created before section
+  // boundaries were introduced.
+  return marked.replace(
+    /## ([^\n]+)\n\n_Not run: [^\n]*_(?=\n\n---|$)/g,
+    (stub, reviewer: string) => {
+      const priorSection = priorReviewerSection(priorBody, reviewer);
+      return priorSection
+        ? `${priorSection}\n\n> ℹ️ Not updated in this run.`
+        : stub;
+    },
+  );
+}
+
+/** Create or update the single summary assembled after parallel reviewers finish. */
+export async function upsertCombinedSummary(
+  octokit: Octokit,
+  ref: PullRef,
+  body: string,
+): Promise<void> {
+  const self = await getSelfLogin(octokit);
+  const comments = await listIssueComments(octokit, ref);
+  const prior = comments
+    .reverse()
+    .find(
+      (comment) =>
+        comment.user?.login === self &&
+        comment.body?.includes(COMBINED_SUMMARY_MARKER),
+    );
+  const mergedBody = preserveSkippedSummarySections(body, prior?.body);
+  const currentReviewers = new Set(
+    [
+      ...mergedBody.matchAll(
+        /<!-- loupe:summary:([^\s]+) sha=[0-9a-f]{7,40} -->/g,
+      ),
+    ].map((match) => match[1]),
+  );
+  const retainedMarkers = comments
+    .filter((comment) => comment.user?.login === self)
+    .flatMap((comment) => [
+      ...(comment.body?.matchAll(
+        /<!-- loupe:summary:([^\s]+) sha=[0-9a-f]{7,40} -->/g,
+      ) ?? []),
+    ])
+    .filter((match) => match[1] && !currentReviewers.has(match[1]))
+    .map((match) => match[0]);
+  const markedBody = [
+    mergedBody.trim(),
+    ...new Set(retainedMarkers),
+    COMBINED_SUMMARY_MARKER,
+  ].join("\n\n");
+  if (prior) {
+    await octokit.issues.updateComment({
+      owner: ref.owner,
+      repo: ref.repo,
+      comment_id: prior.id,
+      body: markedBody,
+    });
+  } else {
+    await octokit.issues.createComment({
+      owner: ref.owner,
+      repo: ref.repo,
+      issue_number: ref.pull_number,
+      body: markedBody,
+    });
+  }
+
+  // Preserve legacy comments for history, but tag them as stale only after the
+  // replacement exists. Updating is best-effort and never invalidates a review.
+  for (const comment of comments) {
+    if (
+      comment.id !== prior?.id &&
+      comment.user?.login === self &&
+      comment.body?.includes("<!-- loupe:summary:") &&
+      !comment.body.includes(COMBINED_SUMMARY_MARKER) &&
+      !comment.body.includes("<!-- loupe:summary:stale -->")
+    ) {
+      try {
+        await octokit.issues.updateComment({
+          owner: ref.owner,
+          repo: ref.repo,
+          comment_id: comment.id,
+          body: `${comment.body.trim()}\n\n> ℹ️ This legacy reviewer summary is stale. Loupe now publishes a single combined summary.\n\n<!-- loupe:summary:stale -->`,
+        });
+      } catch {
+        // The combined summary is already live; a legacy-tagging failure must
+        // not turn a completed review into a failed one.
+      }
+    }
+  }
+}
 
 export async function postReview(
   octokit: Octokit,
@@ -605,7 +843,7 @@ export async function postReview(
   dropped: readonly Finding[],
   logger: Logger,
   opts: PostReviewOptions,
-): Promise<void> {
+): Promise<string> {
   // Snapshot first, post second, clean up last: a failed post must never leave
   // the PR with its old comments gone and no replacement.
   const prior = await snapshotPriorComments(
@@ -654,30 +892,35 @@ export async function postReview(
     });
   }
 
-  const self = await getSelfLogin(octokit);
-  const comments = await listIssueComments(octokit, ref);
-  const priorSummary = comments
-    .reverse()
-    .find(
-      (comment) =>
-        comment.user?.login === self &&
-        comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)),
-    );
-  if (priorSummary) {
-    await octokit.issues.updateComment({
-      owner: ref.owner,
-      repo: ref.repo,
-      comment_id: priorSummary.id,
-      body: summaryBody,
-    });
-  } else {
-    await octokit.issues.createComment({
-      owner: ref.owner,
-      repo: ref.repo,
-      issue_number: ref.pull_number,
-      body: summaryBody,
-    });
+  if (!opts.deferSummary) {
+    const self = await getSelfLogin(octokit);
+    const comments = await listIssueComments(octokit, ref);
+    const priorSummary = comments
+      .reverse()
+      .find(
+        (comment) =>
+          comment.user?.login === self &&
+          comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)) &&
+          !comment.body.includes(COMBINED_SUMMARY_MARKER) &&
+          !comment.body.includes("<!-- loupe:summary:stale -->"),
+      );
+    if (priorSummary) {
+      await octokit.issues.updateComment({
+        owner: ref.owner,
+        repo: ref.repo,
+        comment_id: priorSummary.id,
+        body: summaryBody,
+      });
+    } else {
+      await octokit.issues.createComment({
+        owner: ref.owner,
+        repo: ref.repo,
+        issue_number: ref.pull_number,
+        body: summaryBody,
+      });
+    }
   }
 
   await cleanupPriorComments(octokit, ref, prior, logger);
+  return summaryBody;
 }

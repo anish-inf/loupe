@@ -1,6 +1,6 @@
 # How loupe works
 
-loupe is a GitHub Action that reviews pull requests with an agentic coding CLI (whip, claude, or codex). A repo declares one or more focused **reviewers** in a `.loupe.json`, each with its own prompt and file globs. loupe runs every reviewer whose globs match a changed file and posts inline comments plus one persistent summary comment per reviewer.
+loupe is a GitHub Action that reviews pull requests with an agentic coding CLI (whip, claude, or codex). A repo declares one or more focused **reviewers** in a `.loupe.json`, each with its own prompt and file globs. loupe runs every reviewer whose globs match a changed file, posts reviewer-specific inline comments, and updates one persistent combined summary.
 
 Source: [context-labs/loupe](https://github.com/context-labs/loupe). loupe reviews its own PRs with [`.loupe/config.json`](../../.loupe/config.json).
 
@@ -38,7 +38,7 @@ The detailed diagrams follow this same path rather than repeating the whole syst
 6. [@loupe chat](./chat.md) covers the separate **comment-command branch**.
 
 - **One job per PR event.** The recommended workflow groups concurrency by PR number so a new push cancels the in-flight review.
-- **Reviewers run in parallel** inside that job. Each one scopes to its globs, runs its own agent, and posts its own review and summary comment.
+- **Reviewers run in parallel** inside that job. Each one scopes to its globs and posts its inline review; the orchestrator updates one combined summary after all finish.
 - **The agent never talks to GitHub.** It reads the checkout and a diff file on disk and emits one JSON object. loupe's TypeScript owns every GitHub API call.
 - **Blockers request changes.** Everything else is a `COMMENT` review. loupe never approves.
 - **Advisory by design.** The recommended workflow runs with `continue-on-error: true` and is not a required check.

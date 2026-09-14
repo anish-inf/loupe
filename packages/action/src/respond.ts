@@ -4,12 +4,15 @@ import { readFileSync } from "node:fs";
 import {
   buildChatSystemPrompt,
   buildChatUserPrompt,
+  buildFixFindingsUserPrompt,
   buildFixSystemPrompt,
   buildFixUserPrompt,
   fetchPullContext,
+  listOpenLoupeFindings,
   makeOctokit,
   postIssueComment,
   updateIssueComment,
+  type OpenLoupeFinding,
   type PullRef,
   type ReviewResult,
 } from "@loupe/core";
@@ -20,7 +23,12 @@ import type { Octokit } from "@octokit/rest";
 import { z } from "zod";
 
 import type { Config } from "./config";
-import { runReviews, type ReviewerOutcome } from "./orchestrate";
+import {
+  CombinedSummaryPublicationError,
+  runReviews,
+  type ReviewerOutcome,
+} from "./orchestrate";
+import { loadReviewers } from "./reviewers";
 
 const MENTION = /@loupe\b/i;
 
@@ -84,13 +92,14 @@ export function renderReviewCompletion(
     );
   const scopeNote = noneInScope
     ? `\n\nNothing to review: this loupe config covers ${dirs?.length ? dirs.map((d) => `\`${d}/\``).join(", ") : "the whole repo"} and no changed file is under it.`
-    : "\n\nEach reviewer's summary comment above was updated in place.";
+    : "\n\nThe combined Loupe summary above was updated in place.";
   return `✅ Re-review of \`${headSha.slice(0, 7)}\` done.\n\n${lines}${scopeNote}`;
 }
 
 const HELP = `**loupe commands** (mention \`@loupe\`):
 - \`@loupe review\` — re-review the whole PR now.
-- \`@loupe fix <what to change>\` — make the change and push a commit to this PR.
+- \`@loupe fix\` — fix all open Loupe findings and push one commit.
+- \`@loupe fix <what to change>\` — make a specific change and push a commit.
 - \`@loupe <question>\` — ask about this PR (e.g. "is the retry loop safe?").
 - \`@loupe help\` — this message.`;
 
@@ -111,8 +120,15 @@ async function runFix(
   ref: PullRef,
   instruction: string,
   logger: Logger,
+  findings?: readonly OpenLoupeFinding[],
+  expectedHead?: string,
 ): Promise<void> {
   const { data: pr } = await octokit.pulls.get(ref);
+  if (expectedHead && pr.head.sha !== expectedHead) {
+    throw new Error(
+      "The PR changed while findings were being collected. Please run `@loupe fix` again.",
+    );
+  }
   if (pr.head.repo?.full_name !== pr.base.repo.full_name) {
     await postIssueComment(
       octokit,
@@ -122,10 +138,17 @@ async function runFix(
     return;
   }
   const headRef = pr.head.ref;
+  const originalHead = pr.head.sha;
   const cwd = config.workdir;
 
   git(cwd, ["fetch", "origin", headRef]);
-  git(cwd, ["checkout", "-B", headRef, "FETCH_HEAD"]);
+  const fetchedHead = git(cwd, ["rev-parse", "FETCH_HEAD"]);
+  if (fetchedHead !== originalHead) {
+    throw new Error(
+      "The PR changed before the fix started. Please run `@loupe fix` again.",
+    );
+  }
+  git(cwd, ["checkout", "-B", headRef, originalHead]);
 
   const harness = getHarness(config.harnessName);
   const env = await resolveCredentials(
@@ -136,7 +159,9 @@ async function runFix(
   logger.info("Fix: running agentic harness", { chars: instruction.length });
   await harness.review({
     systemPrompt: buildFixSystemPrompt(),
-    userPrompt: buildFixUserPrompt(instruction, pull.files),
+    userPrompt: findings
+      ? buildFixFindingsUserPrompt(findings, pull.files)
+      : buildFixUserPrompt(instruction, pull.files),
     model: config.model,
     agentic: true,
     workdir: cwd,
@@ -161,6 +186,15 @@ async function runFix(
   git(cwd, ["config", "user.email", "loupe@users.noreply.github.com"]);
   git(cwd, ["add", "-A"]);
   git(cwd, ["commit", "-m", `loupe: ${instruction.slice(0, 60)}`]);
+  git(cwd, ["fetch", "origin", headRef]);
+  if (git(cwd, ["rev-parse", "FETCH_HEAD"]) !== originalHead) {
+    await postIssueComment(
+      octokit,
+      ref,
+      "I made the change, but the PR branch changed while I was working. I did not push over the newer commit; run `@loupe fix` again.",
+    );
+    return;
+  }
   const token = config.token;
   const pushUrl = `https://x-access-token:${token}@github.com/${ref.owner}/${ref.repo}.git`;
   const push = spawnSync("git", ["push", pushUrl, `HEAD:${headRef}`], {
@@ -242,7 +276,17 @@ export async function handleComment(
         renderReviewCompletion(outcomes, pr.head.sha, config.dirs),
       );
     } catch (err) {
-      await postFailure(octokit, ref, "review", err, logger);
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.error("Chat command failed: review", { error: reason });
+      process.exitCode = 1;
+      await updateIssueComment(
+        octokit,
+        ref,
+        ackId,
+        err instanceof CombinedSummaryPublicationError
+          ? `⚠️ Re-review finished, but Loupe could not publish the combined summary — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`
+          : `⚠️ Loupe could not complete the re-review — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`,
+      );
     }
     return;
   }
@@ -250,17 +294,69 @@ export async function handleComment(
   const fixMatch = /^fix\b[:\s]*(.*)/is.exec(instruction);
   if (fixMatch) {
     logger.info("Chat command: fix");
-    await postIssueComment(octokit, ref, "🔧 On it — working on a fix.");
+    const ackId = await postIssueComment(
+      octokit,
+      ref,
+      "🔧 Got it — preparing the fix and collecting the current findings.",
+    );
     try {
+      const requested = fixMatch[1]?.trim() ?? "";
+      let findings: readonly OpenLoupeFinding[] | undefined;
+      let findingsHead: string | undefined;
+      if (!requested || /^all$/i.test(requested)) {
+        const { data: pr } = await octokit.pulls.get(ref);
+        findingsHead = pr.head.sha;
+        const configured = config.configPath
+          ? loadReviewers(config.configPath)
+              .filter(
+                (reviewer) =>
+                  !config.reviewerFilter ||
+                  reviewer.name === config.reviewerFilter,
+              )
+              .map((reviewer) => reviewer.name)
+          : ["default"];
+        findings = await listOpenLoupeFindings(
+          octokit,
+          ref,
+          pr.head.sha,
+          new Set(configured),
+        );
+        if (findings.length === 0) {
+          await updateIssueComment(
+            octokit,
+            ref,
+            ackId,
+            "✅ There are no open Loupe findings for the current PR head.",
+          );
+          return;
+        }
+      }
+      await updateIssueComment(
+        octokit,
+        ref,
+        ackId,
+        findings
+          ? `🔧 Fixing ${findings.length} open finding${findings.length === 1 ? "" : "s"} from ${new Set(findings.map((finding) => finding.reviewer)).size} reviewer${new Set(findings.map((finding) => finding.reviewer)).size === 1 ? "" : "s"}. I’ll update this PR when the commit is pushed.`
+          : "🔧 Working on the requested change now. I’ll update this PR when the commit is pushed.",
+      );
       await runFix(
         config,
         octokit,
         ref,
-        fixMatch[1]?.trim() || instruction,
+        findings ? "fix all open Loupe findings" : requested,
         logger,
+        findings,
+        findingsHead,
       );
     } catch (err) {
-      await postFailure(octokit, ref, "fix", err, logger);
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.error("Chat command failed: fix", { error: reason });
+      await updateIssueComment(
+        octokit,
+        ref,
+        ackId,
+        `⚠️ I couldn't complete the fix — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`,
+      );
     }
     return;
   }

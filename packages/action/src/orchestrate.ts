@@ -1,4 +1,9 @@
-import { makeOctokit, postIssueComment, type ReviewResult } from "@loupe/core";
+import {
+  makeOctokit,
+  postIssueComment,
+  upsertCombinedSummary,
+  type ReviewResult,
+} from "@loupe/core";
 import type { Logger } from "@loupe/logger";
 
 import type { Config } from "./config";
@@ -11,6 +16,14 @@ import {
 } from "./trace";
 
 /** What one reviewer did: its result, or the failure that was reported on the PR. */
+export class CombinedSummaryPublicationError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = "CombinedSummaryPublicationError";
+    this.cause = cause;
+  }
+}
+
 export type ReviewerOutcome =
   | { readonly name: string; readonly ok: true; readonly result: ReviewResult }
   | { readonly name: string; readonly ok: false; readonly error: string };
@@ -65,6 +78,30 @@ async function runOne(
  * review regardless of config. Reviewer failures are reported on the PR here
  * and returned as outcomes. Only setup errors (bad config) reject.
  */
+function renderCombinedSummary(outcomes: readonly ReviewerOutcome[]): string {
+  const sections = outcomes.map((outcome) => {
+    const start = `<!-- loupe:section:${outcome.name}:start -->`;
+    const end = `<!-- loupe:section:${outcome.name}:end -->`;
+    let content: string;
+    if (!outcome.ok) {
+      content = `## ${outcome.name}\n\n⚠️ Reviewer failed: ${outcome.error.split("\n")[0]?.slice(0, 300)}`;
+    } else if (!outcome.result.summaryBody) {
+      content = `## ${outcome.name}\n\n_Not run: ${outcome.result.summary}_`;
+    } else {
+      content = outcome.result.summaryBody.replace(
+        /^### 🔍 [^\n]+\n\n/,
+        `## ${outcome.name}\n\n`,
+      );
+    }
+    return `${start}\n${content}\n${end}`;
+  });
+  return [
+    "# 🔍 Loupe review",
+    ...sections,
+    "Use `@loupe fix` to address all open findings.",
+  ].join("\n\n---\n\n");
+}
+
 export async function runReviews(
   config: Config,
   logger: Logger,
@@ -127,6 +164,7 @@ export async function runReviews(
             maxTurns: r.maxTurns ?? config.maxTurns,
             priorComments: r.priorComments ?? config.priorComments,
             procedure: r.procedure ?? config.procedure,
+            deferSummary: true,
             logger,
           },
           r.name,
@@ -154,6 +192,7 @@ export async function runReviews(
           timezone: config.timezone,
           priorComments: config.priorComments,
           procedure: config.procedure,
+          deferSummary: true,
           logger,
         },
         "default",
@@ -182,5 +221,18 @@ export async function runReviews(
     });
   }
 
+  try {
+    await upsertCombinedSummary(
+      makeOctokit(config.token, logger),
+      {
+        owner: config.owner,
+        repo: config.repo,
+        pull_number: config.pullNumber,
+      },
+      renderCombinedSummary(outcomes),
+    );
+  } catch (err) {
+    throw new CombinedSummaryPublicationError(err);
+  }
   return outcomes;
 }
