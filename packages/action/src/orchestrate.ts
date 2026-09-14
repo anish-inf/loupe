@@ -4,6 +4,11 @@ import type { Logger } from "@loupe/logger";
 import type { Config } from "./config";
 import { loadReviewers } from "./reviewers";
 import { formatResult, reviewPullRequest, type RunInput } from "./run";
+import {
+  createTraceCollector,
+  writeReviewsTraceToSummary,
+  type ReviewerTrace,
+} from "./trace";
 
 /** What one reviewer did: its result, or the failure that was reported on the PR. */
 export type ReviewerOutcome =
@@ -14,16 +19,21 @@ export type ReviewerOutcome =
  * Run one reviewer, reporting its own failure on the PR so a broken reviewer
  * never reads as silence. The failure comment carries a bounded reason and no
  * marker or SHA, so it can never be mistaken for a review or advance
- * incremental state.
+ * incremental state. `onTrace` receives the reviewer's normalized harness
+ * events (if the caller wants to record them).
  */
 async function runOne(
   config: Config,
   input: RunInput,
   label: string,
   logger: Logger,
+  onTrace?: (e: Parameters<NonNullable<RunInput["trace"]>>[0]) => void,
 ): Promise<ReviewerOutcome> {
   try {
-    const result = await reviewPullRequest(input);
+    const result = await reviewPullRequest({
+      ...input,
+      trace: onTrace,
+    });
     logger.info(`[${label}] ${formatResult(result)}`);
     return { name: label, ok: true, result };
   } catch (err) {
@@ -77,6 +87,11 @@ export async function runReviews(
     full,
   };
 
+  const reviewersDone: {
+    readonly run: Promise<ReviewerOutcome>;
+    readonly readTrace: () => ReviewerTrace;
+  }[] = [];
+
   if (config.configPath) {
     let reviewers = loadReviewers(config.configPath);
     if (config.reviewerFilter) {
@@ -85,9 +100,10 @@ export async function runReviews(
     logger.info("Running reviewers", {
       reviewers: reviewers.map((r) => r.name),
     });
-    return Promise.all(
-      reviewers.map((r) =>
-        runOne(
+    for (const r of reviewers) {
+      const collector = createTraceCollector(r.name, config.harnessName);
+      reviewersDone.push({
+        run: runOne(
           config,
           {
             ...base,
@@ -115,31 +131,56 @@ export async function runReviews(
           },
           r.name,
           logger,
+          collector.emit,
         ),
+        readTrace: collector.read,
+      });
+    }
+  } else {
+    const collector = createTraceCollector("default", config.harnessName);
+    reviewersDone.push({
+      run: runOne(
+        config,
+        {
+          ...base,
+          model: config.model,
+          reasoning: config.reasoning,
+          profile: config.profile,
+          guidance: config.guidance,
+          ensembleModels: config.ensembleModels.length
+            ? config.ensembleModels
+            : undefined,
+          skills: config.skills.length ? config.skills : undefined,
+          timezone: config.timezone,
+          priorComments: config.priorComments,
+          procedure: config.procedure,
+          logger,
+        },
+        "default",
+        logger,
+        collector.emit,
       ),
-    );
+      readTrace: collector.read,
+    });
   }
 
-  return [
-    await runOne(
-      config,
-      {
-        ...base,
-        model: config.model,
-        reasoning: config.reasoning,
-        profile: config.profile,
-        guidance: config.guidance,
-        ensembleModels: config.ensembleModels.length
-          ? config.ensembleModels
-          : undefined,
-        skills: config.skills.length ? config.skills : undefined,
-        timezone: config.timezone,
-        priorComments: config.priorComments,
-        procedure: config.procedure,
-        logger,
-      },
-      "default",
-      logger,
-    ),
-  ];
+  // All reviewers run concurrently. Each writes only into its own collector
+  // array, so there is no shared mutable buffer to race on. Wait for every
+  // outcome (success or failure) before touching the summary: the trace must
+  // reflect the whole run, including reviewers that errored mid-stream.
+  const outcomes = await Promise.all(reviewersDone.map((r) => r.run));
+  const traces = reviewersDone.map((r) => r.readTrace());
+
+  // Offline, no model calls: append the captured transcripts to the step
+  // summary after outcomes have completed. No-op unless GITHUB_STEP_SUMMARY is
+  // set (e.g. local runs can point it at a scratch file).
+  try {
+    writeReviewsTraceToSummary(traces);
+  } catch (err) {
+    logger.warn("Could not write the review traces to the step summary", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return outcomes;
 }

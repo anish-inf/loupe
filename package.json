@@ -11,6 +11,7 @@
     "lint:fix": "oxlint --type-aware --fix",
     "tsc": "./node_modules/typescript-7/bin/tsc --build",
     "test": "vitest run",
+    "trace:preview": "bun run --cwd packages/action trace:preview",
     "check": "bun format && bun lint && bun tsc && bun test"
   },
   "dependencies": {

@@ -5,6 +5,11 @@ import { join } from "node:path";
 
 import type { Logger } from "@loupe/logger";
 
+import type { HarnessTraceEvent } from "./trace";
+import { envSecretValues, redactSecrets } from "./trace";
+
+export * from "./trace";
+
 /**
  * A whip provider + model catalog, declared in loupe's config so the review
  * workflow doesn't have to hand-write `~/.whip/config.json` in a CI step. When
@@ -58,6 +63,19 @@ export type HarnessContext = {
   /** Stable prompt-cache key (e.g. repo/reviewer) so the provider reuses the
    * cached system prefix across runs. Passed to whip as -cache-key. */
   readonly cacheKey?: string;
+  /**
+   * Optional trace sink. When supplied, every harness event (reasoning deltas,
+   * text, tool_start/tool_end, done/error) is normalized and emitted here so a
+   * caller can observe/record the run's progress and outcome without parsing
+   * raw subprocess output. No-op when unset.
+   */
+  readonly trace?: (event: HarnessTraceEvent) => void;
+  /**
+   * Optional label for which pass or phase this context belongs to (e.g.
+   * "primary", "fallback", "ensemble:model", "verify"). Carried onto emitted
+   * trace events so downstream renderers can group them; purely informational.
+   */
+  readonly phase?: string;
   readonly logger: Logger;
 };
 
@@ -189,6 +207,30 @@ function runWhipStreaming(
   ctx: HarnessContext,
 ): Promise<string> {
   const log = ctx.logger.child("whip");
+  // Known secrets (resolved credential values handed to the subprocess via env)
+  // are scrubbed from every trace payload downstream so an API key that happens
+  // to surface in a tool result or reasoning chunk never lands in the summary.
+  const secrets = envSecretValues(ctx.env);
+  const scrub = (s: string | undefined): string | undefined =>
+    s === undefined ? undefined : redactSecrets(s, secrets);
+  // Scrub every string field on an event (delta/args/result/text/error).
+  const scrubEvent = (event: HarnessTraceEvent): HarnessTraceEvent =>
+    ({
+      ...event,
+      ...("delta" in event ? { delta: scrub(event.delta) } : {}),
+      ...("args" in event ? { args: scrub(event.args) } : {}),
+      ...("result" in event ? { result: scrub(event.result) } : {}),
+      ...("text" in event ? { text: scrub(event.text) } : {}),
+      ...("error" in event ? { error: scrub(event.error) } : {}),
+    }) as HarnessTraceEvent;
+  // Normalize and forward a raw NDJSON event to the optional trace sink,
+  // tagging it with the run's model/phase so renderers can label provenance.
+  const emit = (event: HarnessTraceEvent): void =>
+    ctx.trace?.({
+      ...scrubEvent(event),
+      model: event.model ?? ctx.model,
+      phase: event.phase ?? ctx.phase,
+    });
   log.debug("Spawning harness", { args, cwd: ctx.workdir, model: ctx.model });
   return new Promise((resolve, reject) => {
     const child = spawn("whip", args, {
@@ -213,6 +255,7 @@ function runWhipStreaming(
         log.debug(trimmed); // non-JSON note — surface it raw
         return;
       }
+      for (const t of whipEventToTrace(event)) emit(t);
       switch (event["type"]) {
         case "reasoning":
           if (typeof event["delta"] === "string") {
@@ -275,6 +318,69 @@ function runWhipStreaming(
     child.stdin.write(ctx.userPrompt);
     child.stdin.end();
   });
+}
+
+/**
+ * Normalize one raw whip NDJSON event into the normalized trace events it
+ * represents. Exported so the mapping is unit-testable without spawning a whip
+ * process. Unknown event types and malformed payloads map to an empty list.
+ * Tool args/results are truncated here so a trace consumer never sees an
+ * unbounded blob.
+ */
+export function whipEventToTrace(raw: unknown): HarnessTraceEvent[] {
+  if (!raw || typeof raw !== "object") return [];
+  const event = raw as Record<string, unknown>;
+  const name =
+    typeof event["name"] === "string" ? (event["name"] as string) : "tool";
+  const serialize = (value: unknown): string | undefined => {
+    if (value === undefined) return undefined;
+    if (typeof value === "string") return value.slice(0, 2000);
+    try {
+      return JSON.stringify(value).slice(0, 2000);
+    } catch {
+      return "[unserializable tool payload]";
+    }
+  };
+  switch (event["type"]) {
+    case "reasoning":
+      return typeof event["delta"] === "string"
+        ? [{ type: "reasoning", delta: event["delta"] as string }]
+        : [];
+    case "text":
+      return typeof event["delta"] === "string"
+        ? [{ type: "text", delta: event["delta"] as string }]
+        : [];
+    case "tool_start":
+      return [
+        {
+          type: "tool_start",
+          name,
+          args: serialize(event["args"]),
+        },
+      ];
+    case "tool_end":
+      return [
+        {
+          type: "tool_end",
+          name,
+          result: serialize(event["result"]),
+        },
+      ];
+    case "done":
+      return [
+        {
+          type: "done",
+          text:
+            typeof event["text"] === "string" ? (event["text"] as string) : "",
+        },
+      ];
+    case "error":
+      return [
+        { type: "error", error: JSON.stringify(event["error"] ?? event) },
+      ];
+    default:
+      return [];
+  }
 }
 
 /**

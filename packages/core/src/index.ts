@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import type { Harness, WhipConfig } from "@loupe/harness";
+import type { HarnessTraceEvent } from "@loupe/harness";
 import type { Logger } from "@loupe/logger";
 import type { Octokit } from "@octokit/rest";
 import picomatch from "picomatch";
@@ -137,6 +138,12 @@ export type ReviewRequest = {
   readonly priorComments?: PriorComments;
   /** Append the always-on review procedure to the system prompt (default true). */
   readonly procedure?: boolean;
+  /**
+   * Optional trace sink forwarded to every harness call this review makes
+   * (its primary run, one-shot fallback, each ensemble model, and the
+   * verification pass). When unset, no trace events are emitted.
+   */
+  readonly trace?: (event: HarnessTraceEvent) => void;
   readonly logger: Logger;
 };
 
@@ -403,9 +410,12 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   // Run one model and return its (scope-, profile-filtered, diff-anchored)
   // findings. A subprocess failure OR unparseable output from the agentic run
   // falls back once to a one-shot diff-only review so something still posts;
-  // the fallback's own failure propagates.
+  // the fallback's own failure propagates. `tag` labels the provenance of the
+  // pass on trace events ("primary" for the single/majority model, "ensemble"
+  // for an additional ensemble model); the model id is appended when known.
   const produceOne = async (
     model: string | undefined,
+    tag = "primary",
   ): Promise<{
     inline: Finding[];
     review: ReviewOutput;
@@ -415,10 +425,11 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
       harness: req.harness.name,
       model: model ?? "(harness default)",
       agentic,
+      tag,
       filesInScope: files.length,
       cwd: harnessCwd,
     });
-    const run = (useAgentic: boolean) =>
+    const run = (useAgentic: boolean, phase: string) =>
       req.harness
         .review({
           systemPrompt: useAgentic
@@ -433,19 +444,21 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
           maxTurns: req.maxTurns,
           reasoning: req.reasoning,
           cacheKey,
+          trace: req.trace,
+          phase,
           logger,
         })
         .then(parseReviewOutput);
     let parsed;
     try {
-      parsed = await run(agentic);
+      parsed = await run(agentic, model ? `${tag}:${model}` : tag);
     } catch (err) {
       if (!agentic) throw err;
       logger.warn("Agentic review failed; retrying one-shot from the diff", {
         error: err instanceof Error ? err.message : String(err),
       });
       counts.mode = "fallback";
-      parsed = await run(false);
+      parsed = await run(false, model ? `fallback:${model}` : "fallback");
     }
     counts.malformedFindings += parsed.malformedFindings;
     counts.malformedConcerns += parsed.malformedConcerns;
@@ -474,9 +487,10 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   if (ensemble) {
     logger.info("Ensemble review", { models: ensemble });
     const [firstModel, ...restModels] = ensemble;
-    const firstRun = await produceOne(firstModel);
+    const firstRun = await produceOne(firstModel, "ensemble");
     const runs = [firstRun];
-    for (const model of restModels) runs.push(await produceOne(model)); // sequential
+    for (const model of restModels)
+      runs.push(await produceOne(model, "ensemble")); // sequential
     review = firstRun.review;
     dropped = firstRun.dropped;
     const merged = mergeEnsemble(
@@ -603,6 +617,8 @@ async function verifyInline(
       maxTurns: req.maxTurns,
       reasoning: req.reasoning,
       cacheKey: `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}/verify`,
+      trace: req.trace,
+      phase: req.model ? `verify:${req.model}` : "verify",
       logger: req.logger,
     });
     const result = parseVerification(stdout, findings.length);
