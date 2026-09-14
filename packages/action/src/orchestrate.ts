@@ -1,4 +1,9 @@
-import { makeOctokit, postIssueComment, type ReviewResult } from "@loupe/core";
+import {
+  makeOctokit,
+  postIssueComment,
+  upsertCombinedSummary,
+  type ReviewResult,
+} from "@loupe/core";
 import type { Logger } from "@loupe/logger";
 
 import type { Config } from "./config";
@@ -65,6 +70,26 @@ async function runOne(
  * review regardless of config. Reviewer failures are reported on the PR here
  * and returned as outcomes. Only setup errors (bad config) reject.
  */
+function renderCombinedSummary(outcomes: readonly ReviewerOutcome[]): string {
+  const sections = outcomes.map((outcome) => {
+    if (!outcome.ok) {
+      return `## ${outcome.name}\n\n⚠️ Reviewer failed: ${outcome.error.split("\n")[0]?.slice(0, 300)}`;
+    }
+    if (!outcome.result.summaryBody) {
+      return `## ${outcome.name}\n\n_Not run: ${outcome.result.summary}_`;
+    }
+    return outcome.result.summaryBody.replace(
+      /^### 🔍 [^\n]+\n\n/,
+      `## ${outcome.name}\n\n`,
+    );
+  });
+  return [
+    "# 🔍 Loupe review",
+    ...sections,
+    "Use `@loupe fix` to address all open findings.",
+  ].join("\n\n---\n\n");
+}
+
 export async function runReviews(
   config: Config,
   logger: Logger,

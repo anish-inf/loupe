@@ -620,7 +620,7 @@ describe("summary rendering", () => {
 });
 
 describe("open Loupe findings", () => {
-  it("collects current unresolved findings from configured reviewers only", async () => {
+  it("collects unresolved findings from configured reviewers across incremental heads", async () => {
     const sha = "a".repeat(40);
     api = octokit({
       threadPages: [
@@ -674,11 +674,44 @@ describe("open Loupe findings", () => {
         sha,
         url: "https://example.test/thread",
       },
+      {
+        reviewer: "code",
+        path: "src/d.ts",
+        body: "stale",
+        sha: "b".repeat(40),
+        url: "https://example.test/thread",
+      },
     ]);
   });
 });
 
 describe("combined summary", () => {
+  it("preserves a skipped reviewer's previous section", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      issueComments: [
+        {
+          id: 2,
+          body: `# Loupe\n\n---\n\n## code\n\nPrevious findings\n\n<!-- loupe:summary:code sha=${sha} -->\n\n---\n\nUse fix\n\n<!-- loupe:summary:combined -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(
+      api as never,
+      ref,
+      "# Loupe\n\n---\n\n## code\n\n_Not run: No in-scope changes since the last review._\n\n---\n\nUse fix",
+    );
+    const update = api.issues.updateComment.mock.calls[0] as unknown as [
+      { body: string },
+    ];
+    const body = update[0].body;
+    expect(body).toContain("Previous findings");
+    expect(body).toContain("Not updated in this run");
+    expect(body).toContain(`<!-- loupe:summary:code sha=${sha} -->`);
+    expect(body).not.toContain("_Not run:");
+  });
+
   it("updates only the bot-authored combined summary", async () => {
     api = octokit({
       issueComments: [

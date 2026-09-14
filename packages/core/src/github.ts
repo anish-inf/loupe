@@ -338,11 +338,12 @@ query LoupeReviewThreads($owner: String!, $repo: String!, $number: Int!, $after:
   }
 }`;
 
-/** List actionable open findings across reviewers for the current PR head. */
+/** List unresolved findings across configured reviewers, including findings
+ * retained by incremental reviews from an earlier head. */
 export async function listOpenLoupeFindings(
   octokit: Octokit,
   ref: PullRef,
-  headSha: string,
+  _headSha: string,
   reviewers?: ReadonlySet<string>,
 ): Promise<OpenLoupeFinding[]> {
   const self = await getSelfLogin(octokit);
@@ -368,7 +369,7 @@ export async function listOpenLoupeFindings(
         (self === "github-actions[bot]" && rootAuthor === "github-actions");
       if (!root || root.replyTo || !authoredBySelf) continue;
       const marker = parseFindingMarker(root.body);
-      if (!marker || marker.sha !== headSha) continue;
+      if (!marker) continue;
       if (reviewers && !reviewers.has(marker.reviewer)) continue;
       const body = root.body
         .replace(
@@ -680,6 +681,25 @@ export type PostReviewOptions = {
   readonly deferSummary?: boolean;
 };
 
+function preserveSkippedSummarySections(
+  body: string,
+  priorBody?: string,
+): string {
+  if (!priorBody) return body;
+  return body.replace(
+    /## ([^\n]+)\n\n_Not run: [^\n]*_(?=\n\n---|$)/g,
+    (stub, reviewer: string) => {
+      const escaped = reviewer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const priorSection = new RegExp(
+        `## ${escaped}\\n\\n[\\s\\S]*?(?=\\n\\n---|\\n\\n<!-- loupe:summary:combined -->|$)`,
+      ).exec(priorBody)?.[0];
+      return priorSection
+        ? `${priorSection}\n\n> ℹ️ Not updated in this run.`
+        : stub;
+    },
+  );
+}
+
 /** Create or update the single summary assembled after parallel reviewers finish. */
 export async function upsertCombinedSummary(
   octokit: Octokit,
@@ -695,9 +715,12 @@ export async function upsertCombinedSummary(
         comment.user?.login === self &&
         comment.body?.includes(COMBINED_SUMMARY_MARKER),
     );
+  const mergedBody = preserveSkippedSummarySections(body, prior?.body);
   const currentReviewers = new Set(
     [
-      ...body.matchAll(/<!-- loupe:summary:([^\s]+) sha=[0-9a-f]{7,40} -->/g),
+      ...mergedBody.matchAll(
+        /<!-- loupe:summary:([^\s]+) sha=[0-9a-f]{7,40} -->/g,
+      ),
     ].map((match) => match[1]),
   );
   const retainedMarkers = comments
@@ -710,7 +733,7 @@ export async function upsertCombinedSummary(
     .filter((match) => match[1] && !currentReviewers.has(match[1]))
     .map((match) => match[0]);
   const markedBody = [
-    body.trim(),
+    mergedBody.trim(),
     ...new Set(retainedMarkers),
     COMBINED_SUMMARY_MARKER,
   ].join("\n\n");
