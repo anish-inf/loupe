@@ -681,6 +681,21 @@ export type PostReviewOptions = {
   readonly deferSummary?: boolean;
 };
 
+function priorReviewerSection(
+  priorBody: string,
+  reviewer: string,
+): string | undefined {
+  const escaped = reviewer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const marker = new RegExp(
+    `<!-- loupe:summary:${escaped} sha=[0-9a-f]{7,40} -->`,
+  ).exec(priorBody);
+  if (!marker?.[0] || marker.index === undefined) return undefined;
+  const heading = `## ${reviewer}\n\n`;
+  const start = priorBody.lastIndexOf(heading, marker.index);
+  if (start < 0) return undefined;
+  return priorBody.slice(start, marker.index + marker[0].length);
+}
+
 function preserveSkippedSummarySections(
   body: string,
   priorBody?: string,
@@ -689,10 +704,7 @@ function preserveSkippedSummarySections(
   return body.replace(
     /## ([^\n]+)\n\n_Not run: [^\n]*_(?=\n\n---|$)/g,
     (stub, reviewer: string) => {
-      const escaped = reviewer.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const priorSection = new RegExp(
-        `## ${escaped}\\n\\n[\\s\\S]*?(?=\\n\\n---|\\n\\n<!-- loupe:summary:combined -->|$)`,
-      ).exec(priorBody)?.[0];
+      const priorSection = priorReviewerSection(priorBody, reviewer);
       return priorSection
         ? `${priorSection}\n\n> ℹ️ Not updated in this run.`
         : stub;
@@ -753,20 +765,27 @@ export async function upsertCombinedSummary(
     });
   }
 
-  // Migrate cleanly from the former one-summary-per-reviewer layout, but only
-  // after the replacement exists and only for comments authored by this token.
+  // Preserve legacy comments for history, but tag them as stale only after the
+  // replacement exists. Updating is best-effort and never invalidates a review.
   for (const comment of comments) {
     if (
       comment.id !== prior?.id &&
       comment.user?.login === self &&
       comment.body?.includes("<!-- loupe:summary:") &&
-      !comment.body.includes(COMBINED_SUMMARY_MARKER)
+      !comment.body.includes(COMBINED_SUMMARY_MARKER) &&
+      !comment.body.includes("<!-- loupe:summary:stale -->")
     ) {
-      await octokit.issues.deleteComment({
-        owner: ref.owner,
-        repo: ref.repo,
-        comment_id: comment.id,
-      });
+      try {
+        await octokit.issues.updateComment({
+          owner: ref.owner,
+          repo: ref.repo,
+          comment_id: comment.id,
+          body: `${comment.body.trim()}\n\n> ℹ️ This legacy reviewer summary is stale. Loupe now publishes a single combined summary.\n\n<!-- loupe:summary:stale -->`,
+        });
+      } catch {
+        // The combined summary is already live; a legacy-tagging failure must
+        // not turn a completed review into a failed one.
+      }
     }
   }
 }
@@ -836,7 +855,9 @@ export async function postReview(
       .find(
         (comment) =>
           comment.user?.login === self &&
-          comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)),
+          comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)) &&
+          !comment.body.includes(COMBINED_SUMMARY_MARKER) &&
+          !comment.body.includes("<!-- loupe:summary:stale -->"),
       );
     if (priorSummary) {
       await octokit.issues.updateComment({

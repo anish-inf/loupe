@@ -272,7 +272,15 @@ export async function handleComment(
         renderReviewCompletion(outcomes, pr.head.sha, config.dirs),
       );
     } catch (err) {
-      await postFailure(octokit, ref, "review", err, logger);
+      const reason = err instanceof Error ? err.message : String(err);
+      logger.error("Chat command failed: review", { error: reason });
+      process.exitCode = 1;
+      await updateIssueComment(
+        octokit,
+        ref,
+        ackId,
+        `⚠️ Re-review finished, but Loupe could not publish the combined summary — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`,
+      );
     }
     return;
   }

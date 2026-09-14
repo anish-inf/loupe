@@ -692,7 +692,7 @@ describe("combined summary", () => {
       issueComments: [
         {
           id: 2,
-          body: `# Loupe\n\n---\n\n## code\n\nPrevious findings\n\n<!-- loupe:summary:code sha=${sha} -->\n\n---\n\nUse fix\n\n<!-- loupe:summary:combined -->`,
+          body: `# Loupe\n\n---\n\n## code\n\nPrevious findings\n\n---\n\nStill part of code review\n\n<!-- loupe:summary:code sha=${sha} -->\n\n---\n\nUse fix\n\n<!-- loupe:summary:combined -->`,
           user: bot,
         },
       ],
@@ -707,9 +707,30 @@ describe("combined summary", () => {
     ];
     const body = update[0].body;
     expect(body).toContain("Previous findings");
+    expect(body).toContain("Still part of code review");
     expect(body).toContain("Not updated in this run");
     expect(body).toContain(`<!-- loupe:summary:code sha=${sha} -->`);
     expect(body).not.toContain("_Not run:");
+  });
+
+  it("marks legacy summaries stale without deleting them", async () => {
+    api = octokit({
+      issueComments: [
+        {
+          id: 3,
+          body: `legacy\n\n<!-- loupe:summary:code sha=${"a".repeat(40)} -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(api as never, ref, "# New summary");
+    expect(api.issues.deleteComment).not.toHaveBeenCalled();
+    expect(api.issues.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        comment_id: 3,
+        body: expect.stringContaining("<!-- loupe:summary:stale -->"),
+      }),
+    );
   });
 
   it("updates only the bot-authored combined summary", async () => {
