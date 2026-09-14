@@ -138,6 +138,8 @@ export type ReviewRequest = {
   readonly priorComments?: PriorComments;
   /** Append the always-on review procedure to the system prompt (default true). */
   readonly procedure?: boolean;
+  /** Post inline findings now, but let the caller aggregate the summary. */
+  readonly deferSummary?: boolean;
   /**
    * Optional trace sink forwarded to every harness call this review makes
    * (its primary run, one-shot fallback, each ensemble model, and the

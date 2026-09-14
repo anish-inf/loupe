@@ -1,6 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { getLastReviewed, postReview } from "../src/github";
+import {
+  getLastReviewed,
+  listOpenLoupeFindings,
+  postReview,
+  upsertCombinedSummary,
+} from "../src/github";
 
 const ref = { owner: "context-labs", repo: "loupe", pull_number: 13 };
 const logger = {
@@ -27,15 +32,17 @@ type Comment = {
 type Thread = {
   id: string;
   path: string;
+  line?: number | null;
   isResolved?: boolean;
   viewerCanResolve?: boolean;
-  root?: { body: string; login: string; reply?: boolean } | null;
+  root?: { body: string; login: string; reply?: boolean; url?: string } | null;
 };
 
 function threadNode(t: Thread) {
   return {
     id: t.id,
     path: t.path,
+    line: t.line ?? null,
     isResolved: t.isResolved ?? false,
     viewerCanResolve: t.viewerCanResolve ?? true,
     comments: {
@@ -43,6 +50,7 @@ function threadNode(t: Thread) {
         ? [
             {
               body: t.root.body,
+              url: t.root.url ?? "https://example.test/thread",
               author: { login: t.root.login },
               replyTo: t.root.reply ? { id: "parent" } : null,
             },
@@ -100,6 +108,7 @@ function octokit({
       listComments: vi.fn(),
       createComment: vi.fn(async (_input?: { body: string }) => ({})),
       updateComment: vi.fn(async () => ({})),
+      deleteComment: vi.fn(async () => ({})),
     },
     pulls: {
       listReviewComments: vi.fn(),
@@ -607,5 +616,87 @@ describe("summary rendering", () => {
     expect(body).toContain("Para one.\n\n```ts\nx();\n```");
     expect(body).toContain("<summary>Run details</summary>");
     expect(body).toContain("headless fallback");
+  });
+});
+
+describe("open Loupe findings", () => {
+  it("collects current unresolved findings from configured reviewers only", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      threadPages: [
+        [
+          {
+            id: "current",
+            path: "src/a.ts",
+            line: 12,
+            root: {
+              body: `🟡 **warning** fix this\n\n<!-- loupe:code sha=${sha} -->`,
+              login: "loupe-bot",
+            },
+          },
+          {
+            id: "resolved",
+            path: "src/b.ts",
+            isResolved: true,
+            root: {
+              body: `old\n\n<!-- loupe:code sha=${sha} -->`,
+              login: "loupe-bot",
+            },
+          },
+          {
+            id: "human",
+            path: "src/c.ts",
+            root: {
+              body: `quoted <!-- loupe:code sha=${sha} -->`,
+              login: "human",
+            },
+          },
+          {
+            id: "stale",
+            path: "src/d.ts",
+            root: {
+              body: `stale\n\n<!-- loupe:code sha=${"b".repeat(40)} -->`,
+              login: "loupe-bot",
+            },
+          },
+        ],
+      ],
+    });
+
+    await expect(
+      listOpenLoupeFindings(api as never, ref, sha, new Set(["code"])),
+    ).resolves.toEqual([
+      {
+        reviewer: "code",
+        path: "src/a.ts",
+        line: 12,
+        body: "🟡 **warning** fix this",
+        sha,
+        url: "https://example.test/thread",
+      },
+    ]);
+  });
+});
+
+describe("combined summary", () => {
+  it("updates only the bot-authored combined summary", async () => {
+    api = octokit({
+      issueComments: [
+        {
+          id: 1,
+          body: "quoted <!-- loupe:summary:combined -->",
+          user: { login: "human" },
+        },
+        { id: 2, body: "old <!-- loupe:summary:combined -->", user: bot },
+      ],
+    });
+    await upsertCombinedSummary(api as never, ref, "# New summary");
+    expect(api.issues.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        comment_id: 2,
+        body: expect.stringContaining("# New summary"),
+      }),
+    );
+    expect(api.issues.createComment).not.toHaveBeenCalled();
   });
 });

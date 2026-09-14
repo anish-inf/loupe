@@ -127,6 +127,7 @@ export async function runReviews(
             maxTurns: r.maxTurns ?? config.maxTurns,
             priorComments: r.priorComments ?? config.priorComments,
             procedure: r.procedure ?? config.procedure,
+            deferSummary: true,
             logger,
           },
           r.name,
@@ -154,6 +155,7 @@ export async function runReviews(
           timezone: config.timezone,
           priorComments: config.priorComments,
           procedure: config.procedure,
+          deferSummary: true,
           logger,
         },
         "default",
@@ -182,5 +184,10 @@ export async function runReviews(
     });
   }
 
+  await upsertCombinedSummary(
+    makeOctokit(config.token, logger),
+    { owner: config.owner, repo: config.repo, pull_number: config.pullNumber },
+    renderCombinedSummary(outcomes),
+  );
   return outcomes;
 }

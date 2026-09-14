@@ -229,9 +229,21 @@ export async function fetchConventions(
 function markerPrefix(reviewerName: string | undefined): string {
   return `<!-- loupe:${reviewerName ?? "default"} `;
 }
+
+/** Parse only inline-finding markers, never summary markers. */
+function parseFindingMarker(
+  body: string,
+): { reviewer: string; sha: string } | undefined {
+  const match =
+    /<!-- loupe:(?!summary:)([^\s]+) sha=([0-9a-f]{7,40}) -->\s*$/.exec(body);
+  const reviewer = match?.[1];
+  const sha = match?.[2];
+  return reviewer && sha ? { reviewer, sha } : undefined;
+}
 function summaryMarkerPrefix(reviewerName: string | undefined): string {
   return `<!-- loupe:summary:${reviewerName ?? "default"} `;
 }
+const COMBINED_SUMMARY_MARKER = "<!-- loupe:summary:combined -->";
 function makeMarker(reviewerName: string | undefined, sha: string): string {
   return `${markerPrefix(reviewerName)}sha=${sha} -->`;
 }
@@ -271,6 +283,15 @@ type PriorSnapshot = {
 
 const EMPTY_SNAPSHOT: PriorSnapshot = { commentIds: [], threadIds: [] };
 
+export type OpenLoupeFinding = {
+  readonly reviewer: string;
+  readonly path: string;
+  readonly line?: number;
+  readonly body: string;
+  readonly sha: string;
+  readonly url?: string;
+};
+
 type ReviewThreadsPage = {
   repository: {
     pullRequest: {
@@ -279,11 +300,13 @@ type ReviewThreadsPage = {
         nodes: ReadonlyArray<{
           id: string;
           path: string;
+          line: number | null;
           isResolved: boolean;
           viewerCanResolve: boolean;
           comments: {
             nodes: ReadonlyArray<{
               body: string;
+              url: string;
               author: { login: string } | null;
               replyTo: { id: string } | null;
             } | null>;
@@ -303,16 +326,70 @@ query LoupeReviewThreads($owner: String!, $repo: String!, $number: Int!, $after:
         nodes {
           id
           path
+          line
           isResolved
           viewerCanResolve
           comments(first: 1) {
-            nodes { body author { login } replyTo { id } }
+            nodes { body url author { login } replyTo { id } }
           }
         }
       }
     }
   }
 }`;
+
+/** List actionable open findings across reviewers for the current PR head. */
+export async function listOpenLoupeFindings(
+  octokit: Octokit,
+  ref: PullRef,
+  headSha: string,
+  reviewers?: ReadonlySet<string>,
+): Promise<OpenLoupeFinding[]> {
+  const self = await getSelfLogin(octokit);
+  const findings: OpenLoupeFinding[] = [];
+  let after: string | null = null;
+  do {
+    const page: ReviewThreadsPage = await octokit.graphql(
+      REVIEW_THREADS_QUERY,
+      {
+        owner: ref.owner,
+        repo: ref.repo,
+        number: ref.pull_number,
+        after,
+      },
+    );
+    const conn = page.repository.pullRequest.reviewThreads;
+    for (const thread of conn.nodes) {
+      if (!thread || thread.isResolved) continue;
+      const root = thread.comments.nodes[0];
+      if (!root || root.replyTo || root.author?.login !== self) continue;
+      const marker = parseFindingMarker(root.body);
+      if (!marker || marker.sha !== headSha) continue;
+      if (reviewers && !reviewers.has(marker.reviewer)) continue;
+      const body = root.body
+        .replace(
+          /\n\n<!-- loupe:(?!summary:)[^\s]+ sha=[0-9a-f]{7,40} -->\s*$/,
+          "",
+        )
+        .trim();
+      findings.push({
+        reviewer: marker.reviewer,
+        path: thread.path,
+        ...(thread.line === null ? {} : { line: thread.line }),
+        body,
+        sha: marker.sha,
+        ...(root.url ? { url: root.url } : {}),
+      });
+    }
+    after = conn.pageInfo.hasNextPage ? conn.pageInfo.endCursor : null;
+  } while (after);
+  return findings.sort(
+    (a, b) =>
+      a.path.localeCompare(b.path) ||
+      (a.line ?? 0) - (b.line ?? 0) ||
+      a.reviewer.localeCompare(b.reviewer),
+  );
+}
 
 const RESOLVE_THREAD_MUTATION = `
 mutation LoupeResolveThread($threadId: ID!) {
@@ -595,7 +672,77 @@ export type PostReviewOptions = {
   readonly priorComments?: PriorComments;
   /** Run diagnostics for the summary; omitted = not rendered. */
   readonly diagnostics?: ReviewDiagnostics;
+  /** Let a higher-level orchestrator publish one summary for all reviewers. */
+  readonly deferSummary?: boolean;
 };
+
+/** Create or update the single summary assembled after parallel reviewers finish. */
+export async function upsertCombinedSummary(
+  octokit: Octokit,
+  ref: PullRef,
+  body: string,
+): Promise<void> {
+  const self = await getSelfLogin(octokit);
+  const comments = await listIssueComments(octokit, ref);
+  const prior = comments
+    .reverse()
+    .find(
+      (comment) =>
+        comment.user?.login === self &&
+        comment.body?.includes(COMBINED_SUMMARY_MARKER),
+    );
+  const currentReviewers = new Set(
+    [
+      ...body.matchAll(/<!-- loupe:summary:([^\s]+) sha=[0-9a-f]{7,40} -->/g),
+    ].map((match) => match[1]),
+  );
+  const retainedMarkers = comments
+    .filter((comment) => comment.user?.login === self)
+    .flatMap((comment) => [
+      ...(comment.body?.matchAll(
+        /<!-- loupe:summary:([^\s]+) sha=[0-9a-f]{7,40} -->/g,
+      ) ?? []),
+    ])
+    .filter((match) => match[1] && !currentReviewers.has(match[1]))
+    .map((match) => match[0]);
+  const markedBody = [
+    body.trim(),
+    ...new Set(retainedMarkers),
+    COMBINED_SUMMARY_MARKER,
+  ].join("\n\n");
+  if (prior) {
+    await octokit.issues.updateComment({
+      owner: ref.owner,
+      repo: ref.repo,
+      comment_id: prior.id,
+      body: markedBody,
+    });
+  } else {
+    await octokit.issues.createComment({
+      owner: ref.owner,
+      repo: ref.repo,
+      issue_number: ref.pull_number,
+      body: markedBody,
+    });
+  }
+
+  // Migrate cleanly from the former one-summary-per-reviewer layout, but only
+  // after the replacement exists and only for comments authored by this token.
+  for (const comment of comments) {
+    if (
+      comment.id !== prior?.id &&
+      comment.user?.login === self &&
+      comment.body?.includes("<!-- loupe:summary:") &&
+      !comment.body.includes(COMBINED_SUMMARY_MARKER)
+    ) {
+      await octokit.issues.deleteComment({
+        owner: ref.owner,
+        repo: ref.repo,
+        comment_id: comment.id,
+      });
+    }
+  }
+}
 
 export async function postReview(
   octokit: Octokit,
@@ -605,7 +752,7 @@ export async function postReview(
   dropped: readonly Finding[],
   logger: Logger,
   opts: PostReviewOptions,
-): Promise<void> {
+): Promise<string> {
   // Snapshot first, post second, clean up last: a failed post must never leave
   // the PR with its old comments gone and no replacement.
   const prior = await snapshotPriorComments(
@@ -654,30 +801,33 @@ export async function postReview(
     });
   }
 
-  const self = await getSelfLogin(octokit);
-  const comments = await listIssueComments(octokit, ref);
-  const priorSummary = comments
-    .reverse()
-    .find(
-      (comment) =>
-        comment.user?.login === self &&
-        comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)),
-    );
-  if (priorSummary) {
-    await octokit.issues.updateComment({
-      owner: ref.owner,
-      repo: ref.repo,
-      comment_id: priorSummary.id,
-      body: summaryBody,
-    });
-  } else {
-    await octokit.issues.createComment({
-      owner: ref.owner,
-      repo: ref.repo,
-      issue_number: ref.pull_number,
-      body: summaryBody,
-    });
+  if (!opts.deferSummary) {
+    const self = await getSelfLogin(octokit);
+    const comments = await listIssueComments(octokit, ref);
+    const priorSummary = comments
+      .reverse()
+      .find(
+        (comment) =>
+          comment.user?.login === self &&
+          comment.body?.includes(summaryMarkerPrefix(opts.reviewerName)),
+      );
+    if (priorSummary) {
+      await octokit.issues.updateComment({
+        owner: ref.owner,
+        repo: ref.repo,
+        comment_id: priorSummary.id,
+        body: summaryBody,
+      });
+    } else {
+      await octokit.issues.createComment({
+        owner: ref.owner,
+        repo: ref.repo,
+        issue_number: ref.pull_number,
+        body: summaryBody,
+      });
+    }
   }
 
   await cleanupPriorComments(octokit, ref, prior, logger);
+  return summaryBody;
 }

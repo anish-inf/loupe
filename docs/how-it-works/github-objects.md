@@ -1,26 +1,18 @@
 # GitHub objects
 
-
 Three kinds of object, all owned by loupe's TypeScript, never by the agent.
 
-| Object | API | Per run | Marker |
-| --- | --- | --- | --- |
-| Pull request review | `pulls.createReview` | 0 or 1, only if there are inline findings or a blocker | `<!-- loupe:<reviewer> sha=<head> -->` in the body when no inline comments |
-| Inline review comment | created inside the review above; prior ones resolved via GraphQL `resolveReviewThread` (or deleted, or kept, per `priorComments`) | n | Same marker appended to every comment body |
-| Summary issue comment | `issues.createComment` first time, `issues.updateComment` after | exactly 1, updated in place | `<!-- loupe:summary:<reviewer> sha=<head> -->` |
+| Object                         | API                                                                                                                               | Per run                                                | Marker                                                                     |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------ | -------------------------------------------------------------------------- |
+| Pull request review            | `pulls.createReview`                                                                                                              | 0 or 1, only if there are inline findings or a blocker | `<!-- loupe:<reviewer> sha=<head> -->` in the body when no inline comments |
+| Inline review comment          | created inside the review above; prior ones resolved via GraphQL `resolveReviewThread` (or deleted, or kept, per `priorComments`) | n                                                      | Same marker appended to every comment body                                 |
+| Combined summary issue comment | `issues.createComment` first time, `issues.updateComment` after                                                                   | exactly 1, updated after all reviewers finish          | `<!-- loupe:summary:combined -->`, plus each reviewer's SHA marker         |
 
-`<reviewer>` is the reviewer's `name` (or `default` with no config), so reviewers never touch each other's objects.
+`<reviewer>` is the reviewer's `name` (or `default` with no config). Inline objects remain reviewer-specific; the single combined summary preserves each reviewer's `<!-- loupe:summary:<reviewer> sha=<head> -->` marker for incremental history.
 
 ## The posting sequence
 
-This page expands the **Post review and summary** box in [A review run](./review-run.md#pipeline). For each reviewer, loupe:
-
-1. snapshots eligible prior threads;
-2. creates a review only when inline findings or a blocker require one;
-3. creates or updates the reviewer's single summary comment; and
-4. resolves, deletes, or keeps the snapshotted threads according to `priorComments`.
-
-Posting happens before cleanup, so a failed post leaves prior comments intact.
+This page expands the **Post review and summary** box in [A review run](./review-run.md#pipeline). Each reviewer snapshots eligible prior threads, posts any required inline review, and then resolves, deletes, or keeps that snapshot according to `priorComments`. After all parallel reviewers finish, the orchestrator creates or updates one combined summary. On migration, old bot-authored per-reviewer summaries are removed after the combined comment exists.
 
 ## Review verdict
 
@@ -49,7 +41,7 @@ Severity emoji: 🔴 blocker, 🟡 warning, 🔵 nit.
 
 ## Summary comment body
 
-~~~
+````
 ### 🔍 loupe · <reviewer>
 
 🔴 1 · 🟡 2 · 4 files · ⚠️ degraded run   (the last part only when something was lost)
@@ -78,7 +70,7 @@ _3 inline comments on the diff below._
 Last reviewed commit: [`abc1234`](link)
 
 <!-- loupe:summary:<reviewer> sha=<head> -->
-~~~
+````
 
 In ensemble mode, minority findings sit in a second `<details>` block titled "Lower-confidence findings (raised by a minority of models)".
 
@@ -90,11 +82,11 @@ A marker in a comment body is not proof loupe wrote it. A person quoting a loupe
 
 Policy `priorComments`, default `resolve`:
 
-| Policy | Effect on this reviewer's earlier threads |
-| --- | --- |
+| Policy    | Effect on this reviewer's earlier threads                                                                                                                                        |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `resolve` | Thread is resolved (visible under "Show resolved"). Means "superseded by a newer review", not "bug proven fixed". Threads the token cannot resolve are left open with a warning. |
-| `delete` | Comment is deleted. |
-| `keep` | Nothing is touched. New comments accumulate. |
+| `delete`  | Comment is deleted.                                                                                                                                                              |
+| `keep`    | Nothing is touched. New comments accumulate.                                                                                                                                     |
 
 Scope, for `resolve` and `delete`:
 
