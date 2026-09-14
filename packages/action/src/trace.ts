@@ -87,16 +87,37 @@ function splitPhases(events: readonly HarnessTraceEvent[]): PhaseTrace[] {
   return phases;
 }
 
+function phaseKind(phase: PhaseTrace): string {
+  return phase.name.split(":")[0] ?? phase.name;
+}
+
 function phaseTitle(phase: PhaseTrace): string {
-  const raw = phase.name.split(":")[0] ?? phase.name;
   const labels: Record<string, string> = {
-    primary: "Primary review",
-    fallback: "Headless fallback",
-    ensemble: "Ensemble review",
-    verify: "Verification",
-    review: "Review",
+    primary: "1. Review the change",
+    fallback: "Retry the review",
+    ensemble: "Independent model review",
+    verify: "2. Double-check the findings",
+    review: "Review the change",
   };
-  return labels[raw] ?? raw;
+  const kind = phaseKind(phase);
+  return labels[kind] ?? kind;
+}
+
+function phaseDescription(phase: PhaseTrace): string {
+  const descriptions: Record<string, string> = {
+    primary:
+      "Loupe looks for problems introduced by this PR. The reasoning explains what it considered; the file and search activity shows what it inspected.",
+    fallback:
+      "The first review attempt did not produce a usable result, so Loupe tried again using the diff directly and without repository tools.",
+    ensemble:
+      "Another configured model reviewed the change independently. Loupe compares its findings with the other models before posting anything.",
+    verify:
+      "Loupe checks each draft finding against the diff one more time. Findings that are not supported are removed before the review is posted.",
+    review:
+      "Loupe reviews the change, investigates relevant code, and produces draft findings.",
+  };
+  const kind = phaseKind(phase);
+  return descriptions[kind] ?? "Loupe ran this step as part of the review.";
 }
 
 function renderPhase(phase: PhaseTrace): string {
@@ -147,6 +168,7 @@ function renderPhase(phase: PhaseTrace): string {
   ].filter(Boolean);
   const out = [
     `#### ${status} ${phaseTitle(phase)}`,
+    phaseDescription(phase),
     [phase.model ? `Model \`${inline(phase.model)}\`` : undefined, ...stats]
       .filter(Boolean)
       .join(" · "),
@@ -154,12 +176,12 @@ function renderPhase(phase: PhaseTrace): string {
 
   if (reasoning) {
     out.push(
-      `<details>\n<summary><strong>🧠 Reasoning</strong> · ${reasoning.length.toLocaleString()} characters</summary>\n\n${code(reasoning, "text", REASONING_CHARS)}\n\n</details>`,
+      `<details>\n<summary><strong>🧠 What the model was thinking about</strong> · ${reasoning.length.toLocaleString()} characters</summary>\n\n> Exploratory reasoning can include ideas the model later rejects.\n\n${code(reasoning, "text", REASONING_CHARS)}\n\n</details>`,
     );
   }
 
   if (tools.length) {
-    out.push("**Investigation**");
+    out.push("**What Loupe inspected**");
     tools.forEach((tool, index) => {
       const summary = `${index + 1}. <code>${inline(tool.name)}</code>${tool.args ? ` · ${inline(truncate(tool.args, 180))}` : ""}`;
       const body = [
@@ -180,7 +202,7 @@ function renderPhase(phase: PhaseTrace): string {
   const final = outcome?.status === "done" ? outcome.text : reply;
   if (final) {
     out.push(
-      `<details>\n<summary><strong>📝 Model output</strong> · ${final.length.toLocaleString()} characters</summary>\n\n${code(final, "json")}\n\n</details>`,
+      `<details>\n<summary><strong>📝 Result from this step</strong> · ${final.length.toLocaleString()} characters</summary>\n\n${code(final, "json")}\n\n</details>`,
     );
   }
 
@@ -210,7 +232,7 @@ export function renderTraceSection(
   const completed = events.some((event) => event.type === "done");
 
   const overview = [
-    "| Harness | Model | Phases | Tool calls | Reasoning |",
+    "| Agent | Model | Steps | Inspections | Thinking captured |",
     "| --- | --- | ---: | ---: | ---: |",
     `| \`${inline(opts.harness ?? "unknown")}\` | ${model ? `\`${inline(model)}\`` : "—"} | ${phases.length} | ${tools} | ${reasoning.toLocaleString()} chars |`,
   ].join("\n");
@@ -242,8 +264,10 @@ function boundSummary(body: string): string {
 
 export function renderReviewsTrace(traces: readonly ReviewerTrace[]): string {
   const parts = [
-    `## 🔎 Loupe review trace`,
-    `> ${traces.length} reviewer${traces.length === 1 ? "" : "s"} · Captured from Whip's live event stream · No additional model calls`,
+    `## 🔎 How Loupe reviewed this change`,
+    `> ${traces.length} reviewer${traces.length === 1 ? "" : "s"} · This is a record of the existing review, not an additional model run.`,
+    "",
+    "Loupe first **reviews the change** and investigates the repository. If it finds possible problems, it then **double-checks those findings** before posting them.",
   ];
   for (const trace of traces) {
     parts.push(
