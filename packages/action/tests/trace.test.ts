@@ -19,152 +19,166 @@ function sample(): HarnessTraceEvent[] {
     {
       type: "reasoning",
       delta: "user wants a safe file read; check for path traversal. ",
+      model: "kimi-k3",
+      phase: "primary:kimi-k3",
     },
-    { type: "text", delta: '{"summary":' },
-    { type: "tool_start", name: "read", args: '{"path":"src/a.ts"}' },
-    { type: "tool_end", name: "read", result: "export const a = 1;" },
-    { type: "text", delta: '"done","findings":[]}' },
-    { type: "done", text: '{"summary":"safe","findings":[],"concerns":[]}' },
+    { type: "text", delta: '{"summary":', phase: "primary:kimi-k3" },
+    {
+      type: "tool_start",
+      name: "read",
+      args: '{"path":"src/a.ts"}',
+      phase: "primary:kimi-k3",
+    },
+    {
+      type: "tool_end",
+      name: "read",
+      result: "export const a = 1;",
+      phase: "primary:kimi-k3",
+    },
+    {
+      type: "text",
+      delta: '"done","findings":[]}',
+      phase: "primary:kimi-k3",
+    },
+    {
+      type: "done",
+      text: '{"summary":"safe","findings":[],"concerns":[]}',
+      phase: "primary:kimi-k3",
+    },
   ];
 }
 
 describe("renderTraceSection", () => {
-  it("renders reasoning (collapsed), tools, final result and metadata", () => {
-    const events = [
+  it("renders a compact overview and collapsible phase details", () => {
+    const md = renderTraceSection("engine", sample(), { harness: "whip" });
+    expect(md).toContain("### ✅ engine");
+    expect(md).toContain(
+      "| Harness | Model | Phases | Tool calls | Reasoning |",
+    );
+    expect(md).toContain("| `whip` | `kimi-k3` | 1 | 1 | 55 chars |");
+    expect(md).toContain("#### ✅ Primary review");
+    expect(md).toContain("<strong>🧠 Reasoning</strong>");
+    expect(md).toContain("**Investigation**");
+    expect(md).toContain("<summary>1. <code>read</code>");
+    expect(md).toContain("<strong>📝 Model output</strong>");
+    // The terminal output replaces, rather than duplicates, streamed reply text.
+    expect(md.match(/📝 Model output/g)).toHaveLength(1);
+  });
+
+  it("separates primary and verification phases", () => {
+    const md = renderTraceSection("engine", [
+      ...sample(),
       {
         type: "reasoning",
-        delta: "think a ",
+        delta: "check evidence",
         model: "kimi-k3",
-        phase: "primary:kimi-k3",
+        phase: "verify:kimi-k3",
       },
-      { type: "reasoning", delta: "think b " },
-      { type: "tool_start", name: "read", args: "sm://secret path" },
-      { type: "tool_end", name: "read", result: "a`b" },
-      { type: "done", text: '{"ok":true}' },
-    ] as HarnessTraceEvent[];
-    const md = renderTraceSection("engine", events);
-    expect(md).toContain("### `engine`");
-    expect(md).toContain("model: `kimi-k3`");
-    expect(md).toContain("phase: `primary:kimi-k3`");
-    expect(md).toContain("reasoning");
-    expect(md).toContain("**tools** (1)");
-    expect(md).toContain("**read**");
-    // A backtick inside a tool result is escaped so it can't break surrounding
-    // markdown (safe even within a code fence).
-    expect(md).toContain("a\\`b");
-    expect(md).toContain("**result:** ✅ done");
+      {
+        type: "done",
+        text: '{"verdicts":[]}',
+        model: "kimi-k3",
+        phase: "verify:kimi-k3",
+      },
+    ]);
+    expect(md).toContain("#### ✅ Primary review");
+    expect(md).toContain("#### ✅ Verification");
+    expect(md).toContain("| `unknown` | `kimi-k3` | 2 |");
   });
 
-  it("escapes markdown and HTML control characters", () => {
+  it("escapes HTML in untrusted event content", () => {
     const md = renderTraceSection("x", [
-      { type: "tool_start", name: "grep", args: "pattern `x` <details>" },
-      { type: "tool_end", name: "grep", result: "a`b </details>" },
+      { type: "tool_start", name: "grep", args: "pattern <details>" },
+      { type: "tool_end", name: "grep", result: "</details><script>" },
       { type: "done", text: "ok" },
     ] as HarnessTraceEvent[]);
-    expect(md).not.toContain("pattern `x`");
-    expect(md).not.toContain("</details>\n**result");
-    expect(md).toContain("\\`");
+    expect(md).not.toContain("<script>");
     expect(md).toContain("&lt;details&gt;");
+    expect(md).toContain("&lt;/details&gt;&lt;script&gt;");
   });
 
-  it("surfaces an error outcome even without a done event", () => {
+  it("surfaces errors as a warning callout", () => {
     const md = renderTraceSection("x", [
       { type: "error", error: "exit 1: boom" },
     ] as HarnessTraceEvent[]);
-    expect(md).toContain("**result:** ⚠️ error");
+    expect(md).toContain("### ⚠️ x");
+    expect(md).toContain("> [!WARNING]");
     expect(md).toContain("boom");
   });
 
-  it("marks an empty trace as no events captured", () => {
-    const md = renderTraceSection("x", []);
-    expect(md).toContain("no trace events captured");
+  it("marks an empty trace", () => {
+    expect(renderTraceSection("x", [])).toContain(
+      "No trace events were captured",
+    );
   });
 
-  it("adds a Whip-only note for a non-whip harness, even with a done event", () => {
+  it("adds a Whip-only note for a non-whip harness", () => {
     const md = renderTraceSection(
       "x",
       [{ type: "done", text: "[]" } as HarnessTraceEvent],
       { harness: "claude" },
     );
-    expect(md).toContain("harness: `claude`");
-    expect(md).toContain("**Whip-only**");
-    expect(md).toContain("doesn't stream the whip-style event log");
-    // The final outcome still renders alongside the note.
-    expect(md).toContain("**result:** ✅ done");
-  });
-
-  it("shows the harness in metadata when present", () => {
-    const md = renderTraceSection(
-      "x",
-      [{ type: "done", text: "[]" } as HarnessTraceEvent],
-      { harness: "whip" },
-    );
-    expect(md).toContain("harness: `whip`");
+    expect(md).toContain("| `claude` | — | 1 |");
+    expect(md).toContain("available only for Whip");
   });
 });
 
 describe("renderReviewsTrace", () => {
-  it("renders every reviewer and stays bounded by the char cap", () => {
+  it("renders every reviewer and stays bounded", () => {
     const traces: ReviewerTrace[] = [
-      { reviewer: "code", events: sample() },
+      { reviewer: "code", harness: "whip", events: sample() },
       { reviewer: "migrations", events: [{ type: "done", text: "[]" }] },
     ];
     const md = renderReviewsTrace(traces);
-    expect(md).toContain("## 🔎 Review traces (2 reviewers)");
-    expect(md).toContain("### `code`");
-    expect(md).toContain("### `migrations`");
+    expect(md).toContain("## 🔎 Loupe review trace");
+    expect(md).toContain("> 2 reviewers");
+    expect(md).toContain("### ✅ code");
+    expect(md).toContain("### ✅ migrations");
 
-    // Bounded: a huge reasoning stream is truncated, not dumped whole.
     const huge: HarnessTraceEvent[] = [
       { type: "reasoning", delta: "y".repeat(40000) },
       { type: "done", text: "ok" },
     ];
-    const bounded = renderReviewsTrace([{ reviewer: "huge", events: huge }]);
-    expect(bounded.length).toBeLessThan(100000);
+    expect(
+      renderReviewsTrace([{ reviewer: "huge", events: huge }]).length,
+    ).toBeLessThan(100000);
   });
 });
 
 describe("createTraceCollector", () => {
-  it("accumulates events per collector and snapshots independently", () => {
-    const c = createTraceCollector("code");
-    c.emit({ type: "text", delta: "a" });
-    c.emit({ type: "done", text: "b" });
-    expect([...c.events]).toHaveLength(2);
-    const snap = c.read();
-    expect(snap.reviewer).toBe("code");
-    expect(snap.events).toHaveLength(2);
-    // The snapshot is defensive: pushing later doesn't change it.
-    c.emit({ type: "text", delta: "c" });
-    expect(snap.events).toHaveLength(2);
-    expect(c.events).toHaveLength(3);
-  });
-
-  it("carries the harness label onto the snapshot", () => {
-    const c = createTraceCollector("code", "claude");
-    expect(c.read().harness).toBe("claude");
+  it("accumulates events and returns defensive snapshots", () => {
+    const collector = createTraceCollector("code", "whip");
+    collector.emit({ type: "text", delta: "a" });
+    collector.emit({ type: "done", text: "b" });
+    const snapshot = collector.read();
+    collector.emit({ type: "text", delta: "c" });
+    expect(snapshot.events).toHaveLength(2);
+    expect(collector.events).toHaveLength(3);
+    expect(snapshot.harness).toBe("whip");
   });
 });
 
 describe("writeReviewsTraceToSummary", () => {
-  it("appends to the path from GITHUB_STEP_SUMMARY when set", () => {
-    const p = join(mkdtempSync(join(tmpdir(), "loupe-summary-")), "summary.md");
-    writeFileSync(p, "preexisting\n");
-    writeReviewsTraceToSummary([{ reviewer: "code", events: sample() }], {
-      GITHUB_STEP_SUMMARY: p,
-    } as NodeJS.ProcessEnv);
-    const out = readFileSync(p, "utf8");
-    expect(out).toContain("preexisting");
-    expect(out).toContain("## 🔎 Review traces");
-    expect(out).toContain("### `code`");
+  it("appends to GITHUB_STEP_SUMMARY", () => {
+    const path = join(
+      mkdtempSync(join(tmpdir(), "loupe-summary-")),
+      "summary.md",
+    );
+    writeFileSync(path, "preexisting\n");
+    writeReviewsTraceToSummary(
+      [{ reviewer: "code", harness: "whip", events: sample() }],
+      { GITHUB_STEP_SUMMARY: path } as NodeJS.ProcessEnv,
+    );
+    const output = readFileSync(path, "utf8");
+    expect(output).toContain("preexisting");
+    expect(output).toContain("## 🔎 Loupe review trace");
+    expect(output).toContain("### ✅ code");
   });
 
-  it("is a no-op without GITHUB_STEP_SUMMARY", () => {
+  it("is a no-op without a summary path or traces", () => {
     expect(() =>
       writeReviewsTraceToSummary([{ reviewer: "code", events: sample() }], {}),
     ).not.toThrow();
-  });
-
-  it("is a no-op with no reviewer traces", () => {
     expect(() =>
       writeReviewsTraceToSummary([], { GITHUB_STEP_SUMMARY: "/tmp/x.md" }),
     ).not.toThrow();
