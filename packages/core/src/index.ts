@@ -29,6 +29,7 @@ import { parseReviewOutput, parseVerification } from "./parse";
 import {
   severitiesForProfile,
   type Finding,
+  type Note,
   type Profile,
   type ReviewOutput,
 } from "./types";
@@ -155,7 +156,7 @@ export type ReviewResult = {
   readonly requestedChanges: boolean;
   readonly summary: string;
   readonly inline: readonly Finding[];
-  readonly dropped: readonly Finding[];
+  readonly dropped: readonly Note[];
   readonly diagnostics: ReviewDiagnostics;
   /** Rich per-reviewer Markdown used by the action's combined summary. */
   readonly summaryBody?: string;
@@ -172,6 +173,7 @@ const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
   profileDropped: 0,
   verifyDropped: 0,
   offDiff: 0,
+  salvagedFindings: 0,
 };
 
 /** End-to-end: fetch PR + conventions, run the harness, post the review. */
@@ -409,6 +411,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     mode: (agentic ? "agentic" : "headless") as ReviewDiagnostics["mode"],
     malformedFindings: 0,
     malformedConcerns: 0,
+    salvagedFindings: 0,
     outOfScope: 0,
     profileDropped: 0,
   };
@@ -425,7 +428,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   ): Promise<{
     inline: Finding[];
     review: ReviewOutput;
-    dropped: Finding[];
+    dropped: Note[];
   }> => {
     logger.info("Running harness", {
       harness: req.harness.name,
@@ -472,10 +475,19 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     // context file would duplicate a prior comment we deliberately kept.
     const inScope = parsed.review.findings.filter((f) => focus.has(f.path));
     counts.outOfScope += parsed.review.findings.length - inScope.length;
+    // Salvaged findings have no anchor to validate, so they go straight to the
+    // off-diff notes — under the same scope rule as everything else.
+    const salvaged = parsed.salvagedFindings.filter((f) => focus.has(f.path));
+    counts.salvagedFindings += salvaged.length;
+    counts.outOfScope += parsed.salvagedFindings.length - salvaged.length;
     const validated = validateFindings(inScope, files);
     const inline = validated.inline.filter((f) => keep.has(f.severity));
     counts.profileDropped += validated.inline.length - inline.length;
-    return { inline, review: parsed.review, dropped: [...validated.dropped] };
+    return {
+      inline,
+      review: parsed.review,
+      dropped: [...validated.dropped, ...salvaged],
+    };
   };
 
   const ensemble =
@@ -484,7 +496,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
       : undefined;
 
   let review: ReviewOutput;
-  let dropped: Finding[];
+  let dropped: Note[];
   let inline: Finding[];
   let uncertain: Finding[] = [];
   let verify: ReviewDiagnostics["verify"] = "skipped";
@@ -541,6 +553,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     profileDropped: counts.profileDropped,
     verifyDropped,
     offDiff: dropped.length,
+    salvagedFindings: counts.salvagedFindings,
   };
 
   // Ensemble minority findings go in a collapsed lower-confidence section.

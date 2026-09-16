@@ -3,7 +3,12 @@ import { Octokit } from "@octokit/rest";
 import type { Logger } from "@loupe/logger";
 
 import type { DiffFile } from "./diff";
-import type { Finding, ReviewOutput } from "./types";
+import {
+  anchorLabel,
+  type Finding,
+  type Note,
+  type ReviewOutput,
+} from "./types";
 
 export type PullRef = {
   readonly owner: string;
@@ -556,6 +561,8 @@ export type ReviewDiagnostics = {
   readonly verifyDropped: number;
   /** Off-diff notes actually published under "Other notes". */
   readonly offDiff: number;
+  /** Schema-rejected findings kept as notes instead of dropped. */
+  readonly salvagedFindings: number;
 };
 
 /** True when the run lost or skipped something the reader should know about. */
@@ -577,7 +584,11 @@ function renderDiagnostics(d: ReviewDiagnostics): string {
     `- verification: ${d.verify}`,
     `- scope: ${d.incremental}${d.incremental === "unknown" ? " (history lookup failed; prior comments kept)" : ""}`,
     `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification`,
-    `- off-diff notes published: ${d.offDiff}`,
+    `- off-diff notes published: ${d.offDiff}${
+      d.salvagedFindings > 0
+        ? ` (${d.salvagedFindings} salvaged from malformed finding(s))`
+        : ""
+    }`,
   ];
   return `<details><summary>Run details</summary>\n\n${rows.join("\n")}\n\n</details>`;
 }
@@ -608,7 +619,7 @@ function renderReviewBody(
   stats: string,
   review: ReviewOutput,
   inline: readonly Finding[],
-  dropped: readonly Finding[],
+  dropped: readonly Note[],
   diagnostics: ReviewDiagnostics | undefined,
   tag: string,
 ): string {
@@ -645,7 +656,7 @@ function renderReviewBody(
       `<details><summary>Other notes (${dropped.length})</summary>\n\n${dropped
         .map(
           (f) =>
-            `${SEV_EMOJI[f.severity]} \`${f.path}:${f.line}\`\n\n${f.body.trim()}`,
+            `${SEV_EMOJI[f.severity]} \`${anchorLabel(f)}\`\n\n${f.body.trim()}`,
         )
         .join("\n\n")}\n\n</details>`,
     );
@@ -840,7 +851,7 @@ export async function postReview(
   ref: PullRef,
   review: ReviewOutput,
   inline: readonly Finding[],
-  dropped: readonly Finding[],
+  dropped: readonly Note[],
   logger: Logger,
   opts: PostReviewOptions,
 ): Promise<string> {

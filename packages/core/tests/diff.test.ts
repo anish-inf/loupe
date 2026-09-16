@@ -79,6 +79,42 @@ describe("parseReviewOutput", () => {
     expect(malformedFindings).toBe(1);
   });
 
+  it("salvages a schema-rejected finding that still has a path and a body", () => {
+    const { review, salvagedFindings, malformedFindings } = parseReviewOutput(
+      JSON.stringify({
+        summary: "s",
+        findings: [
+          { path: "a.ts", line: 1, severity: "nit", body: "ok" },
+          { path: "b.ts", severity: "critical", body: "no line given" },
+          { path: "c.ts", line: 0, severity: "minor", body: "line is zero" },
+          { path: "d.ts", line: "42", body: "line came back as a string" },
+        ],
+      }),
+    );
+    // "42" coerces to a real line, so d.ts stays a normal inline finding.
+    expect(review.findings.map((f) => f.path)).toEqual(["a.ts", "d.ts"]);
+    expect(malformedFindings).toBe(0);
+    expect(salvagedFindings).toEqual([
+      { path: "b.ts", severity: "blocker", body: "no line given" },
+      { path: "c.ts", severity: "nit", body: "line is zero" },
+    ]);
+  });
+
+  it("drops a finding with no usable body or path instead of salvaging it", () => {
+    const { salvagedFindings, malformedFindings } = parseReviewOutput(
+      JSON.stringify({
+        summary: "s",
+        findings: [
+          { path: "a.ts", body: "   " },
+          { line: 4, body: "no path" },
+          { path: "b.ts", body: { note: "not a string" } },
+        ],
+      }),
+    );
+    expect(salvagedFindings).toEqual([]);
+    expect(malformedFindings).toBe(3);
+  });
+
   it("keeps multi-paragraph Markdown bodies with code fences intact", () => {
     const body =
       "First paragraph.\n\n```ts\nawait x();\n```\n\nSecond paragraph.";

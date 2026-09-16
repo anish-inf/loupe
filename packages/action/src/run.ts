@@ -1,4 +1,5 @@
 import {
+  anchorLabel,
   isDegraded,
   makeOctokit,
   runReview,
@@ -145,7 +146,7 @@ export function renderReview(result: ReviewResult): string {
     `Run: mode=${d.mode} verify=${d.verify} scope=${d.incremental} malformed=${d.malformedDropped.findings}/${d.malformedDropped.concerns} outOfScope=${d.outOfScopeDropped} profile=${d.profileDropped} verifyDropped=${d.verifyDropped}\n`,
   ];
   for (const f of [...result.inline, ...result.dropped]) {
-    lines.push(`${SEVERITY_MARK[f.severity] ?? "•"} ${f.path}:${f.line}`);
+    lines.push(`${SEVERITY_MARK[f.severity] ?? "•"} ${anchorLabel(f)}`);
     lines.push(`   ${f.body}\n`);
   }
   return lines.join("\n");

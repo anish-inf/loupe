@@ -606,6 +606,7 @@ describe("summary rendering", () => {
           profileDropped: 0,
           verifyDropped: 0,
           offDiff: 1,
+          salvagedFindings: 0,
         },
       },
     );
@@ -616,6 +617,41 @@ describe("summary rendering", () => {
     expect(body).toContain("Para one.\n\n```ts\nx();\n```");
     expect(body).toContain("<summary>Run details</summary>");
     expect(body).toContain("headless fallback");
+  });
+
+  it("renders a salvaged note with no line as a bare path", async () => {
+    api = octokit();
+    await postReview(
+      api as never,
+      ref,
+      output,
+      [],
+      [{ path: "src/a.ts", severity: "blocker", body: "Race on retry." }],
+      logger,
+      {
+        reviewerName: "code",
+        headSha: "d".repeat(40),
+        fileCount: 1,
+        diagnostics: {
+          mode: "agentic",
+          verify: "skipped",
+          incremental: "full",
+          malformedDropped: { findings: 0, concerns: 0 },
+          outOfScopeDropped: 0,
+          profileDropped: 0,
+          verifyDropped: 0,
+          offDiff: 1,
+          salvagedFindings: 1,
+        },
+      },
+    );
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as { body: string }
+    ).body;
+    expect(body).toContain("<summary>Other notes (1)</summary>");
+    expect(body).toContain("`src/a.ts`");
+    expect(body).not.toContain("undefined");
+    expect(body).toContain("1 salvaged from malformed finding(s)");
   });
 });
 

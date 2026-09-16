@@ -4,7 +4,10 @@ import {
   concernSchema,
   findingSchema,
   reviewOutputSchema,
+  salvagedFindingSchema,
   verificationSchema,
+  type Finding,
+  type Note,
   type ReviewOutput,
 } from "./types";
 
@@ -24,6 +27,11 @@ function parseLenient(text: string): unknown {
 /** A parsed review plus what the parser had to discard to produce it. */
 export type ParsedReview = {
   readonly review: ReviewOutput;
+  /**
+   * Findings that failed the per-item schema but still carry a path and body,
+   * kept as off-diff notes instead of being discarded.
+   */
+  readonly salvagedFindings: readonly Note[];
   /** Findings that failed the per-item schema and were dropped. */
   readonly malformedFindings: number;
   /** Concerns that failed the per-item schema and were dropped. */
@@ -87,7 +95,22 @@ export function parseReviewOutput(stdout: string): ParsedReview {
       const r = schema.safeParse(i);
       return r.success && r.data !== undefined ? [r.data] : [];
     });
-  const keptFindings = pick(findings, findingSchema);
+  const keptFindings: Finding[] = [];
+  const salvagedFindings: Note[] = [];
+  let malformedFindings = 0;
+  for (const item of findings) {
+    const kept = findingSchema.safeParse(item);
+    if (kept.success) {
+      keptFindings.push(kept.data);
+      continue;
+    }
+    // A rejected finding is usually just a bad line number. Keep it as a note
+    // when the path and body still read — the model's work is otherwise lost
+    // with nothing but a count to show for it.
+    const salvaged = salvagedFindingSchema.safeParse(item);
+    if (salvaged.success) salvagedFindings.push(salvaged.data);
+    else malformedFindings++;
+  }
   const keptConcerns = pick(concerns, concernSchema);
   return {
     review: {
@@ -97,7 +120,8 @@ export function parseReviewOutput(stdout: string): ParsedReview {
       highlights: highlights.map((h) => h.trim()).filter(Boolean),
       diagram: diagram?.trim() ? diagram.trim() : undefined,
     },
-    malformedFindings: findings.length - keptFindings.length,
+    salvagedFindings,
+    malformedFindings,
     malformedConcerns: concerns.length - keptConcerns.length,
   };
 }
