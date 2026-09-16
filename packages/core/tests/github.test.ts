@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  changedFilesBetween,
   getLastReviewed,
   listOpenLoupeFindings,
   postReview,
@@ -803,5 +804,30 @@ describe("combined summary", () => {
       }),
     );
     expect(api.issues.createComment).not.toHaveBeenCalled();
+  });
+});
+
+describe("changedFilesBetween", () => {
+  it("reports the pre-rename path of a renamed file so its stale threads can be refreshed", async () => {
+    const api = {
+      repos: {
+        compareCommits: vi.fn(async () => ({
+          data: {
+            files: [
+              { filename: "src/b.ts", previous_filename: "src/a.ts" },
+              { filename: "src/c.ts" },
+            ],
+          },
+        })),
+      },
+    };
+    const delta = await changedFilesBetween(
+      api as never,
+      ref,
+      "a".repeat(40),
+      "d".repeat(40),
+    );
+    expect([...delta.paths]).toEqual(["src/b.ts", "src/c.ts"]);
+    expect([...delta.renamedFrom]).toEqual([["src/b.ts", "src/a.ts"]]);
   });
 });

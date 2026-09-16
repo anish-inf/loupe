@@ -158,6 +158,14 @@ export async function updateIssueComment(
 /** GitHub's compare endpoint lists at most this many files; at the cap the list may be incomplete. */
 const COMPARE_FILE_CAP = 300;
 
+/** The incremental-review delta: head paths, plus where renamed files came from. */
+export type ChangedFiles = {
+  /** Paths as they stand at `head`. */
+  readonly paths: ReadonlySet<string>;
+  /** Head path -> the path that file had at `base`, for renamed entries only. */
+  readonly renamedFrom: ReadonlyMap<string, string>;
+};
+
 /**
  * Files changed between two commits (the incremental-review delta). Throws
  * when the response hits GitHub's file cap, because a silently truncated delta
@@ -168,7 +176,7 @@ export async function changedFilesBetween(
   ref: PullRef,
   base: string,
   head: string,
-): Promise<Set<string>> {
+): Promise<ChangedFiles> {
   const { data } = await octokit.repos.compareCommits({
     owner: ref.owner,
     repo: ref.repo,
@@ -181,7 +189,11 @@ export async function changedFilesBetween(
       `compare ${base.slice(0, 7)}..${head.slice(0, 7)} returned ${files.length} files (GitHub cap); delta may be incomplete`,
     );
   }
-  return new Set(files.map((f) => f.filename));
+  const renamedFrom = new Map<string, string>();
+  for (const f of files) {
+    if (f.previous_filename) renamedFrom.set(f.filename, f.previous_filename);
+  }
+  return { paths: new Set(files.map((f) => f.filename)), renamedFrom };
 }
 
 /**

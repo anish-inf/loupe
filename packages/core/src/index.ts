@@ -276,8 +276,16 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
           last.sha,
           pull.headSha,
         );
-        files = scopedFiles.filter((f) => delta.has(f.path));
+        files = scopedFiles.filter((f) => delta.paths.has(f.path));
         refreshPaths = new Set(files.map((f) => f.path));
+        // A file renamed since the last review leaves this reviewer's prior
+        // threads anchored at a path that no longer exists, where nothing
+        // would ever match them again. Refresh the old path too so those
+        // threads are cleaned up with the rest of the file's.
+        for (const f of files) {
+          const previous = delta.renamedFrom.get(f.path);
+          if (previous) refreshPaths.add(previous);
+        }
         incremental = "delta";
         logger.info("Incremental review", {
           priorSha: last.sha.slice(0, 9),
