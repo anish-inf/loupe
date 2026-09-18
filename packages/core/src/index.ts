@@ -277,7 +277,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
           last.sha,
           pull.headSha,
         );
-        files = scopedFiles.filter((f) => delta.paths.has(f.path));
+        files = scopedFiles.filter((f) => delta.has(f.path));
         refreshPaths = new Set(files.map((f) => f.path));
         incremental = "delta";
         logger.info("Incremental review", {

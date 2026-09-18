@@ -161,25 +161,21 @@ export async function updateIssueComment(
 /** GitHub's compare endpoint lists at most this many files; at the cap the list may be incomplete. */
 const COMPARE_FILE_CAP = 300;
 
-/** The incremental-review delta: head paths, plus where renamed files came from. */
-export type ChangedFiles = {
-  /** Paths as they stand at `head`. */
-  readonly paths: ReadonlySet<string>;
-  /** Head path -> the path that file had at `base`, for renamed entries only. */
-  readonly renamedFrom: ReadonlyMap<string, string>;
-};
-
 /**
  * Files changed between two commits (the incremental-review delta). Throws
  * when the response hits GitHub's file cap, because a silently truncated delta
  * would drop files from the review and then advance the reviewed SHA past them.
+ *
+ * Renamed files need no special handling here: threads stranded at a vanished
+ * old path are swept by `snapshotPriorComments` (via `headPaths`), which covers
+ * renames, delete+add rewrites, deletions, and full reviews alike.
  */
 export async function changedFilesBetween(
   octokit: Octokit,
   ref: PullRef,
   base: string,
   head: string,
-): Promise<ChangedFiles> {
+): Promise<Set<string>> {
   const { data } = await octokit.repos.compareCommits({
     owner: ref.owner,
     repo: ref.repo,
@@ -192,11 +188,7 @@ export async function changedFilesBetween(
       `compare ${base.slice(0, 7)}..${head.slice(0, 7)} returned ${files.length} files (GitHub cap); delta may be incomplete`,
     );
   }
-  const renamedFrom = new Map<string, string>();
-  for (const f of files) {
-    if (f.previous_filename) renamedFrom.set(f.filename, f.previous_filename);
-  }
-  return { paths: new Set(files.map((f) => f.filename)), renamedFrom };
+  return new Set(files.map((f) => f.filename));
 }
 
 /**
@@ -417,20 +409,13 @@ mutation LoupeResolveThread($threadId: ID!) {
 }`;
 
 /**
- * Select this reviewer's prior inline comments so re-reviews replace rather
- * than duplicate. Only comments posted under loupe's own login with this
- * reviewer's marker qualify; a human quoting the marker is left alone. Scope:
- * `undefined` paths = every such comment, an empty set = none, otherwise only
- * comments on those paths. Runs BEFORE the new review posts so the snapshot
- * can never include the replacements. Best-effort: a failed lookup selects
- * nothing and warns.
- */
-/**
  * Take a point-in-time snapshot of this reviewer's prior comments eligible for
- * cleanup. `scope` selects which paths are in scope; `undefined` selects every
- * such comment. Runs BEFORE the new review posts so the snapshot can never
- * include the replacements. Best-effort: a failed lookup selects nothing and
- * warns.
+ * cleanup, so re-reviews replace rather than duplicate. Only comments posted
+ * under loupe's own login with this reviewer's marker qualify; a human quoting
+ * the marker is left alone. `scope` selects which paths are eligible:
+ * `undefined` = every such comment, otherwise only those paths. Runs BEFORE
+ * the new review posts so the snapshot can never include the replacements.
+ * Best-effort: a failed lookup selects nothing and warns.
  */
 async function snapshotPriorComments(
   octokit: Octokit,
