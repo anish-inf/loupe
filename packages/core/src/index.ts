@@ -16,6 +16,7 @@ import picomatch from "picomatch";
 
 import {
   changedFilesBetween,
+  cleanupStrandedThreads,
   fetchConventions,
   fetchPullContext,
   getLastReviewed,
@@ -278,14 +279,6 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
         );
         files = scopedFiles.filter((f) => delta.paths.has(f.path));
         refreshPaths = new Set(files.map((f) => f.path));
-        // A file renamed since the last review leaves this reviewer's prior
-        // threads anchored at a path that no longer exists, where nothing
-        // would ever match them again. Refresh the old path too so those
-        // threads are cleaned up with the rest of the file's.
-        for (const f of files) {
-          const previous = delta.renamedFrom.get(f.path);
-          if (previous) refreshPaths.add(previous);
-        }
         incremental = "delta";
         logger.info("Incremental review", {
           priorSha: last.sha.slice(0, 9),
@@ -295,6 +288,19 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
         if (files.length === 0) {
           logger.info(
             "No in-scope files changed since last review; keeping prior comments",
+          );
+          // Even with nothing to reassess, threads stranded by a rename or
+          // deletion since the last review would otherwise sit there forever,
+          // since no scoped refresh will ever reach them.
+          await cleanupStrandedThreads(
+            octokit,
+            req.ref,
+            pull.headPaths,
+            logger,
+            {
+              reviewerName: req.reviewerName,
+              priorComments: req.priorComments,
+            },
           );
           return emptyResult("No in-scope changes since the last review.");
         }
@@ -600,6 +606,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
       reviewerName: req.reviewerName,
       headSha: pull.headSha,
       refreshPaths,
+      headPaths: pull.headPaths,
       fileCount: files.length,
       priorComments: req.priorComments,
       diagnostics,
