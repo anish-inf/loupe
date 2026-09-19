@@ -313,6 +313,7 @@ describe("runReview end to end", () => {
       profileDropped: 0,
       verifyDropped: 0,
       offDiff: 0,
+      salvagedFindings: 0,
     });
 
     // Only B's prior thread resolved, and only after review + summary posted.
