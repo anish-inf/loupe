@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  cleanupStrandedThreads,
   getLastReviewed,
   listOpenLoupeFindings,
   postReview,
@@ -803,5 +804,93 @@ describe("combined summary", () => {
       }),
     );
     expect(api.issues.createComment).not.toHaveBeenCalled();
+  });
+});
+
+describe("stranded-thread cleanup", () => {
+  const marker = `<!-- loupe:code sha=${"a".repeat(40)} -->`;
+  const resolveCalls = () =>
+    api.graphql.mock.calls
+      .filter(([q]) => (q as string).includes("resolveReviewThread"))
+      .map(([, vars]) => (vars as { threadId: string }).threadId);
+
+  it("sweeps a thread stranded at a renamed file's old path, even out of scope", async () => {
+    // src/old.ts was renamed to src/new.ts, which is outside this reviewer's
+    // refresh scope. The thread at the vanished old path must still be swept.
+    api = octokit({
+      threadPages: [
+        [
+          {
+            id: "t-stranded",
+            path: "src/old.ts",
+            root: { body: marker, login: "loupe-bot" },
+          },
+          {
+            id: "t-alive",
+            path: "src/a.ts",
+            root: { body: marker, login: "loupe-bot" },
+          },
+        ],
+      ],
+    });
+    await postReview(api as never, ref, output, [], [], logger, {
+      reviewerName: "code",
+      headSha: "d".repeat(40),
+      fileCount: 1,
+      refreshPaths: new Set(["src/a.ts"]),
+      headPaths: new Set(["src/new.ts", "src/a.ts"]),
+    });
+    expect(resolveCalls()).toEqual(["t-stranded", "t-alive"]);
+  });
+
+  it("does not sweep threads on paths that still exist at head", async () => {
+    api = octokit({
+      threadPages: [
+        [
+          {
+            id: "t-off-scope",
+            path: "src/z.ts",
+            root: { body: marker, login: "loupe-bot" },
+          },
+        ],
+      ],
+    });
+    await postReview(api as never, ref, output, [], [], logger, {
+      reviewerName: "code",
+      headSha: "d".repeat(40),
+      fileCount: 1,
+      refreshPaths: new Set(["src/a.ts"]),
+      headPaths: new Set(["src/z.ts", "src/a.ts"]),
+    });
+    expect(resolveCalls()).toEqual([]);
+  });
+
+  it("cleanupStrandedThreads resolves only stranded threads when nothing is reassessed", async () => {
+    api = octokit({
+      threadPages: [
+        [
+          {
+            id: "t-stranded",
+            path: "gone.ts",
+            root: { body: marker, login: "loupe-bot" },
+          },
+          {
+            id: "t-alive",
+            path: "kept.ts",
+            root: { body: marker, login: "loupe-bot" },
+          },
+        ],
+      ],
+    });
+    await cleanupStrandedThreads(
+      api as never,
+      ref,
+      new Set(["kept.ts"]),
+      logger,
+      {
+        reviewerName: "code",
+      },
+    );
+    expect(resolveCalls()).toEqual(["t-stranded"]);
   });
 });

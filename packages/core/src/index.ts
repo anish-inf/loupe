@@ -16,6 +16,7 @@ import picomatch from "picomatch";
 
 import {
   changedFilesBetween,
+  cleanupStrandedThreads,
   fetchConventions,
   fetchPullContext,
   getLastReviewed,
@@ -288,6 +289,22 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
           logger.info(
             "No in-scope files changed since last review; keeping prior comments",
           );
+          // Even with nothing to reassess, threads stranded by a rename or
+          // deletion since the last review would otherwise sit there forever,
+          // since no scoped refresh will ever reach them. Skipped on dry runs,
+          // which must not mutate the PR.
+          if (!req.dryRun) {
+            await cleanupStrandedThreads(
+              octokit,
+              req.ref,
+              pull.headPaths,
+              logger,
+              {
+                reviewerName: req.reviewerName,
+                priorComments: req.priorComments,
+              },
+            );
+          }
           return emptyResult("No in-scope changes since the last review.");
         }
       } catch (err) {
@@ -592,6 +609,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
       reviewerName: req.reviewerName,
       headSha: pull.headSha,
       refreshPaths,
+      headPaths: pull.headPaths,
       fileCount: files.length,
       priorComments: req.priorComments,
       diagnostics,

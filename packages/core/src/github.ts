@@ -17,6 +17,8 @@ export type PullContext = {
   readonly files: readonly DiffFile[];
   /** The PR head commit SHA (what this review is of). */
   readonly headSha: string;
+  /** Every file path that exists at `head` (the full PR file list). */
+  readonly headPaths: ReadonlySet<string>;
 };
 
 /**
@@ -51,6 +53,7 @@ export async function fetchPullContext(
     description: pr.body ?? "",
     files: files.map((f) => ({ path: f.filename, patch: f.patch })),
     headSha: pr.head.sha,
+    headPaths: new Set(files.map((f) => f.filename)),
   };
 }
 
@@ -162,6 +165,10 @@ const COMPARE_FILE_CAP = 300;
  * Files changed between two commits (the incremental-review delta). Throws
  * when the response hits GitHub's file cap, because a silently truncated delta
  * would drop files from the review and then advance the reviewed SHA past them.
+ *
+ * Renamed files need no special handling here: threads stranded at a vanished
+ * old path are swept by `snapshotPriorComments` (via `headPaths`), which covers
+ * renames, delete+add rewrites, deletions, and full reviews alike.
  */
 export async function changedFilesBetween(
   octokit: Octokit,
@@ -402,13 +409,13 @@ mutation LoupeResolveThread($threadId: ID!) {
 }`;
 
 /**
- * Select this reviewer's prior inline comments so re-reviews replace rather
- * than duplicate. Only comments posted under loupe's own login with this
- * reviewer's marker qualify; a human quoting the marker is left alone. Scope:
- * `undefined` paths = every such comment, an empty set = none, otherwise only
- * comments on those paths. Runs BEFORE the new review posts so the snapshot
- * can never include the replacements. Best-effort: a failed lookup selects
- * nothing and warns.
+ * Take a point-in-time snapshot of this reviewer's prior comments eligible for
+ * cleanup, so re-reviews replace rather than duplicate. Only comments posted
+ * under loupe's own login with this reviewer's marker qualify; a human quoting
+ * the marker is left alone. `scope` selects which paths are eligible:
+ * `undefined` = every such comment, otherwise only those paths. Runs BEFORE
+ * the new review posts so the snapshot can never include the replacements.
+ * Best-effort: a failed lookup selects nothing and warns.
  */
 async function snapshotPriorComments(
   octokit: Octokit,
@@ -416,12 +423,10 @@ async function snapshotPriorComments(
   reviewerName: string | undefined,
   policy: PriorComments,
   logger: Logger,
-  refreshPaths?: ReadonlySet<string>,
+  scope?: (path: string) => boolean,
 ): Promise<PriorSnapshot> {
-  if (policy === "keep" || refreshPaths?.size === 0) return EMPTY_SNAPSHOT;
+  if (policy === "keep") return EMPTY_SNAPSHOT;
   const prefix = markerPrefix(reviewerName);
-  const inScope = (path: string): boolean =>
-    !refreshPaths || refreshPaths.has(path);
   try {
     const self = await getSelfLogin(octokit);
     if (policy === "delete") {
@@ -440,7 +445,7 @@ async function snapshotPriorComments(
             (c) =>
               c.user?.login === self &&
               c.body.includes(prefix) &&
-              inScope(c.path),
+              (!scope || (c.path !== undefined && scope(c.path))),
           )
           .map((c) => c.id),
         threadIds: [],
@@ -460,7 +465,7 @@ async function snapshotPriorComments(
       );
       const conn = page.repository.pullRequest.reviewThreads;
       for (const t of conn.nodes) {
-        if (!t || t.isResolved || !inScope(t.path)) continue;
+        if (!t || t.isResolved || (scope && !scope(t.path))) continue;
         const root = t.comments.nodes[0];
         if (!root || root.replyTo || root.author?.login !== self) continue;
         if (!root.body.includes(prefix)) continue;
@@ -656,6 +661,50 @@ function renderReviewBody(
 }
 
 /**
+ * The cleanup scope for prior-comment snapshotting: `undefined` = every marked
+ * comment of this reviewer, otherwise only those paths — plus, always, any path
+ * that no longer exists at head. A thread anchored at a vanished path (renamed
+ * or deleted since it was posted) can never be superseded by a scoped refresh,
+ * so it is swept regardless of scope rather than stranded forever. Threads on
+ * paths that still exist stay bound to the scope filter.
+ */
+function scopeFor(
+  refreshPaths: ReadonlySet<string> | undefined,
+  headPaths: ReadonlySet<string> | undefined,
+): ((path: string) => boolean) | undefined {
+  // An empty refresh set means "clean up nothing"; keep that strictness.
+  if (!refreshPaths) return undefined;
+  if (refreshPaths.size === 0) return () => false;
+  if (!headPaths) return (path) => refreshPaths.has(path);
+  return (path) => refreshPaths.has(path) || !headPaths.has(path);
+}
+
+/**
+ * Resolve or delete this reviewer's prior loupe comments anchored at paths that
+ * no longer exist at head — stranded by a rename or deletion, where no scoped
+ * refresh can ever reach them. Best-effort: failures leave threads in place.
+ */
+export async function cleanupStrandedThreads(
+  octokit: Octokit,
+  ref: PullRef,
+  headPaths: ReadonlySet<string>,
+  logger: Logger,
+  options?: { reviewerName?: string; priorComments?: PriorComments },
+): Promise<void> {
+  const policy = options?.priorComments ?? "resolve";
+  if (policy === "keep") return;
+  const snapshot = await snapshotPriorComments(
+    octokit,
+    ref,
+    options?.reviewerName,
+    policy,
+    logger,
+    (path) => !headPaths.has(path),
+  );
+  await cleanupPriorComments(octokit, ref, snapshot, logger);
+}
+
+/**
  * Post inline findings as an empty-body review and create or update this
  * reviewer's persistent issue-comment summary. Uses REQUEST_CHANGES when any
  * finding is a blocker, otherwise COMMENT — never APPROVE (a bot shouldn't be a
@@ -671,6 +720,12 @@ export type PostReviewOptions = {
    * reviewer, empty set = clean up nothing, otherwise only those paths.
    */
   readonly refreshPaths?: ReadonlySet<string>;
+  /**
+   * Paths that exist at head (the full PR file list). A prior thread anchored
+   * at any other path is stranded — its file was renamed or deleted — and is
+   * swept regardless of scope.
+   */
+  readonly headPaths?: ReadonlySet<string>;
   /** Files in scope, for the stat line. */
   readonly fileCount: number;
   /** What to do with prior inline comments (default resolve). */
@@ -846,14 +901,20 @@ export async function postReview(
 ): Promise<string> {
   // Snapshot first, post second, clean up last: a failed post must never leave
   // the PR with its old comments gone and no replacement.
-  const prior = await snapshotPriorComments(
-    octokit,
-    ref,
-    opts.reviewerName,
-    opts.priorComments ?? "resolve",
-    logger,
-    opts.refreshPaths,
-  );
+  // Snapshot first, post second, clean up last: a failed post must never leave
+  // the PR with its old comments gone and no replacement. An empty refresh set
+  // means "clean up nothing" (unknown history) — skip the lookup entirely.
+  const prior =
+    opts.refreshPaths?.size === 0
+      ? EMPTY_SNAPSHOT
+      : await snapshotPriorComments(
+          octokit,
+          ref,
+          opts.reviewerName,
+          opts.priorComments ?? "resolve",
+          logger,
+          scopeFor(opts.refreshPaths, opts.headPaths),
+        );
 
   const hasBlocker = [...inline, ...review.concerns].some(
     (f) => f.severity === "blocker",
