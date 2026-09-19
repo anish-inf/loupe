@@ -882,9 +882,15 @@ describe("stranded-thread cleanup", () => {
         ],
       ],
     });
-    await cleanupStrandedThreads(api as never, ref, new Set(["kept.ts"]), logger, {
-      reviewerName: "code",
-    });
+    await cleanupStrandedThreads(
+      api as never,
+      ref,
+      new Set(["kept.ts"]),
+      logger,
+      {
+        reviewerName: "code",
+      },
+    );
     expect(resolveCalls()).toEqual(["t-stranded"]);
   });
 });
