@@ -94,10 +94,14 @@ describe("parseReviewOutput", () => {
     // "42" coerces to a real line, so d.ts stays a normal inline finding.
     expect(review.findings.map((f) => f.path)).toEqual(["a.ts", "d.ts"]);
     expect(malformedFindings).toBe(0);
+    // Severity is capped at `warning` on salvage: the `critical` input would
+    // map to `blocker`, but an unanchored finding must not surface as 🔴.
     expect(salvagedFindings).toEqual([
-      { path: "b.ts", severity: "blocker", body: "no line given" },
+      { path: "b.ts", severity: "warning", body: "no line given" },
       { path: "c.ts", severity: "nit", body: "line is zero" },
     ]);
+    // None of the salvaged notes carry a line — that's the whole point.
+    expect(salvagedFindings.every((f) => f.line === undefined)).toBe(true);
   });
 
   it("drops a finding with no usable body or path instead of salvaging it", () => {

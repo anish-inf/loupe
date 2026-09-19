@@ -619,14 +619,14 @@ describe("summary rendering", () => {
     expect(body).toContain("headless fallback");
   });
 
-  it("renders a salvaged note with no line as a bare path", async () => {
+  it("renders a salvaged note with no line as a bare path, capped and flagged", async () => {
     api = octokit();
     await postReview(
       api as never,
       ref,
       output,
       [],
-      [{ path: "src/a.ts", severity: "blocker", body: "Race on retry." }],
+      [{ path: "src/a.ts", severity: "warning", body: "Race on retry." }],
       logger,
       {
         reviewerName: "code",
@@ -650,8 +650,12 @@ describe("summary rendering", () => {
     ).body;
     expect(body).toContain("<summary>Other notes (1)</summary>");
     expect(body).toContain("`src/a.ts`");
+    expect(body).toContain("_unanchored_");
     expect(body).not.toContain("undefined");
     expect(body).toContain("1 salvaged from malformed finding(s)");
+    // Salvage is lossy parse, so the run is flagged degraded even with zero
+    // genuinely-malformed findings.
+    expect(body).toContain("⚠️ degraded run");
   });
 });
 

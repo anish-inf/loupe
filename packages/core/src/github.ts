@@ -572,7 +572,8 @@ export function isDegraded(d: ReviewDiagnostics): boolean {
     d.verify === "invalid" ||
     d.verify === "failed" ||
     d.incremental === "unknown" ||
-    d.malformedDropped.findings + d.malformedDropped.concerns > 0
+    d.malformedDropped.findings + d.malformedDropped.concerns > 0 ||
+    d.salvagedFindings > 0
   );
 }
 
@@ -656,7 +657,9 @@ function renderReviewBody(
       `<details><summary>Other notes (${dropped.length})</summary>\n\n${dropped
         .map(
           (f) =>
-            `${SEV_EMOJI[f.severity]} \`${anchorLabel(f)}\`\n\n${f.body.trim()}`,
+            `${SEV_EMOJI[f.severity]} \`${anchorLabel(f)}\`${
+              f.line === undefined ? " _unanchored_" : ""
+            }\n\n${f.body.trim()}`,
         )
         .join("\n\n")}\n\n</details>`,
     );

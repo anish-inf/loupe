@@ -58,11 +58,17 @@ export type Note = Omit<Finding, "line"> & { readonly line?: number };
  * notes rather than discarded: a missing or off-scale `line` costs the inline
  * anchor, not the finding itself. Path and body are both required — without
  * them there is nothing to render.
+ *
+ * Severity is capped at `warning`: a finding that couldn't even produce a
+ * usable line is lower-trust than one we anchored, so it must not surface as a
+ * 🔴 blocker next to verified findings.
  */
 export const salvagedFindingSchema = z.object({
   path: z.string().trim().min(1),
   line: z.coerce.number().int().positive().optional().catch(undefined),
-  severity: severitySchema,
+  severity: severitySchema.transform(
+    (s: Severity): Severity => (s === "blocker" ? "warning" : s),
+  ),
   body: z.string().trim().min(1),
 });
 
