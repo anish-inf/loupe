@@ -47,6 +47,7 @@ export type RunInput = {
   readonly maxTurns?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
+  readonly rubric?: boolean;
   readonly deferSummary?: boolean;
   /** Optional trace sink forwarded to every harness call this review makes. */
   readonly trace?: (event: HarnessTraceEvent) => void;
@@ -111,6 +112,7 @@ export async function reviewPullRequest(
     maxTurns: input.maxTurns,
     priorComments: input.priorComments,
     procedure: input.procedure,
+    rubric: input.rubric,
     deferSummary: input.deferSummary,
     trace: input.trace,
     logger,

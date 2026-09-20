@@ -29,6 +29,14 @@
       "reasoning": "medium"
     },
     {
+      "name": "security",
+      "promptFile": "reviewers/security.md",
+      "include": ["**/*.ts", "**/*.tsx", "**/*.go", "**/*.py"],
+      "exclude": ["**/*.test.ts", "**/tests/**"],
+      "reasoning": "high",
+      "rubric": true
+    },
+    {
       "name": "migrations",
       "promptFile": "reviewers/migrations.md",
       "include": [
@@ -36,7 +44,8 @@
         "**/migrations/**/migration.ts",
         "**/migrations/**/*.up.sql"
       ],
-      "reasoning": "high"
+      "reasoning": "high",
+      "rubric": true
     }
   ]
 }

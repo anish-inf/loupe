@@ -19,6 +19,7 @@ const output = {
   summary: "Looks good overall.",
   findings: [],
   concerns: [],
+  callouts: [],
   highlights: ["Small change"],
 };
 
@@ -601,7 +602,7 @@ describe("summary rendering", () => {
           mode: "fallback",
           verify: "invalid",
           incremental: "unknown",
-          malformedDropped: { findings: 1, concerns: 0 },
+          malformedDropped: { findings: 1, concerns: 0, callouts: 0 },
           outOfScopeDropped: 0,
           profileDropped: 0,
           verifyDropped: 0,
@@ -616,6 +617,45 @@ describe("summary rendering", () => {
     expect(body).toContain("Para one.\n\n```ts\nx();\n```");
     expect(body).toContain("<summary>Run details</summary>");
     expect(body).toContain("headless fallback");
+  });
+
+  it("renders human reviewer callouts under a non-blocking section", async () => {
+    api = octokit();
+    const withCallouts = {
+      ...output,
+      callouts: [
+        { kind: "migration", body: "db/migrations/0007.sql" },
+        { kind: "changed-dependency", body: "bun.lock: bumped zod" },
+        { kind: "auth-permissions", body: "route guard moved to middleware" },
+        { kind: "other", body: "experimental thing" },
+      ] as const,
+    };
+    await postReview(api as never, ref, withCallouts, [], [], logger, {
+      reviewerName: "code",
+      headSha: "d".repeat(40),
+      fileCount: 1,
+    });
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as { body: string }
+    ).body;
+    expect(body).toContain("#### Human reviewer callouts (non-blocking)");
+    expect(body).toContain("**📦 Database migration:** db/migrations/0007.sql");
+    expect(body).toContain("**🔄 Changed dependency / lockfile:**");
+    expect(body).toContain("**🔐 Auth / permission behavior:**");
+    expect(body).toContain("**ℹ️ Reviewer callout:** experimental thing");
+  });
+
+  it("omits the callouts section when there are no callouts", async () => {
+    api = octokit();
+    await postReview(api as never, ref, output, [], [], logger, {
+      reviewerName: "code",
+      headSha: "d".repeat(40),
+      fileCount: 1,
+    });
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as { body: string }
+    ).body;
+    expect(body).not.toContain("Human reviewer callouts");
   });
 });
 

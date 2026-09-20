@@ -1,6 +1,7 @@
 import { jsonrepair } from "jsonrepair";
 
 import {
+  calloutSchema,
   concernSchema,
   findingSchema,
   reviewOutputSchema,
@@ -28,6 +29,8 @@ export type ParsedReview = {
   readonly malformedFindings: number;
   /** Concerns that failed the per-item schema and were dropped. */
   readonly malformedConcerns: number;
+  /** Callouts that failed the per-item schema and were dropped. */
+  readonly malformedCallouts: number;
 };
 
 /**
@@ -35,9 +38,9 @@ export type ParsedReview = {
  * or code fences, so we grab the last balanced {...} block and validate it.
  * Throws if no recognizable review object is found — a malformed review is a
  * hard failure, not a silent empty review. "Recognizable" means the object
- * carries a string `summary`; `findings` and `concerns` may be omitted for a
- * clean review but must be arrays when present. An unrelated object like
- * `{"status":"done"}` must not parse as an empty clean review.
+ * carries a string `summary`; `findings`, `concerns`, and `callouts` may be
+ * omitted for a clean review but must be arrays when present. An unrelated
+ * object like `{"status":"done"}` must not parse as an empty clean review.
  */
 export function parseReviewOutput(stdout: string): ParsedReview {
   if (stdout.trim().length === 0) {
@@ -61,6 +64,7 @@ export function parseReviewOutput(stdout: string): ParsedReview {
     summary?: unknown;
     findings?: unknown;
     concerns?: unknown;
+    callouts?: unknown;
   } | null;
   const isArrayOrAbsent = (v: unknown): boolean =>
     v === undefined || Array.isArray(v);
@@ -69,13 +73,14 @@ export function parseReviewOutput(stdout: string): ParsedReview {
     shape === null ||
     typeof shape.summary !== "string" ||
     !isArrayOrAbsent(shape.findings) ||
-    !isArrayOrAbsent(shape.concerns)
+    !isArrayOrAbsent(shape.concerns) ||
+    !isArrayOrAbsent(shape.callouts)
   ) {
     throw new Error(
-      `Harness output is not a review (needs a string "summary"; "findings"/"concerns" must be arrays when present):\n${candidate.slice(0, 1000)}`,
+      `Harness output is not a review (needs a string "summary"; "findings"/"concerns"/"callouts" must be arrays when present):\n${candidate.slice(0, 1000)}`,
     );
   }
-  const { summary, findings, concerns, highlights, diagram } =
+  const { summary, findings, concerns, callouts, highlights, diagram } =
     reviewOutputSchema.parse(parsed);
   // Validate each item independently; drop malformed ones rather than rejecting
   // the entire review.
@@ -89,16 +94,19 @@ export function parseReviewOutput(stdout: string): ParsedReview {
     });
   const keptFindings = pick(findings, findingSchema);
   const keptConcerns = pick(concerns, concernSchema);
+  const keptCallouts = pick(callouts, calloutSchema);
   return {
     review: {
       summary,
       findings: keptFindings,
       concerns: keptConcerns,
+      callouts: keptCallouts,
       highlights: highlights.map((h) => h.trim()).filter(Boolean),
       diagram: diagram?.trim() ? diagram.trim() : undefined,
     },
     malformedFindings: findings.length - keptFindings.length,
     malformedConcerns: concerns.length - keptConcerns.length,
+    malformedCallouts: callouts.length - keptCallouts.length,
   };
 }
 

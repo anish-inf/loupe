@@ -42,6 +42,10 @@ const reviewerSchema = z
     priorComments: z.enum(["resolve", "delete", "keep"]).optional(),
     /** false = drop the always-on review procedure from this reviewer's prompt. */
     procedure: z.boolean().optional(),
+    /** true = append the shared review rubric (fail-fast, untrusted input,
+     * clean-code, comment discipline, non-blocking callouts) to this reviewer's
+     * prompt. Also a top-level default. Off by default. */
+    rubric: z.boolean().optional(),
     /** Directory or directories this reviewer covers; overrides the top-level `dir`. */
     dir: z.union([z.string(), z.array(z.string())]).optional(),
   })
@@ -80,6 +84,7 @@ const configSchema = z.object({
   maxTurns: z.number().int().positive().optional(),
   priorComments: z.enum(["resolve", "delete", "keep"]).optional(),
   procedure: z.boolean().optional(),
+  rubric: z.boolean().optional(),
   whip: whipConfigSchema.optional(),
 });
 
@@ -95,6 +100,7 @@ export type LoupeSettings = {
   readonly maxTurns?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
+  readonly rubric?: boolean;
   readonly whip?: z.infer<typeof whipConfigSchema>;
 };
 
@@ -112,6 +118,7 @@ export function loadSettings(configPath: string): LoupeSettings {
     maxTurns: c.maxTurns,
     priorComments: c.priorComments,
     procedure: c.procedure,
+    rubric: c.rubric,
     whip: c.whip,
   };
 }
@@ -132,6 +139,8 @@ export type Reviewer = {
   readonly maxTurns?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
+  /** Resolved: the reviewer's own value, else the top-level `rubric` default. */
+  readonly rubric?: boolean;
   readonly dirs?: readonly string[];
 };
 
@@ -177,6 +186,8 @@ export function loadReviewers(configPath: string): Reviewer[] {
     maxTurns: r.maxTurns,
     priorComments: r.priorComments,
     procedure: r.procedure,
+    // Reviewer value wins; else the top-level default. undefined = off.
+    rubric: r.rubric ?? config.rubric,
     dirs: asDirs(r.dir),
   }));
 }

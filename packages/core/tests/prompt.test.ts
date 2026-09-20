@@ -105,3 +105,40 @@ describe("review procedure and call sites", () => {
     expect(p).toContain("svc/commands/harness.ts:41");
   });
 });
+
+describe("shared review rubric", () => {
+  it("is off by default so existing reviewers keep their prompt", () => {
+    expect(buildSystemPrompt({})).not.toContain("Shared rubric");
+  });
+
+  it("is appended when rubric: true, after the procedure", () => {
+    const p = buildSystemPrompt({ rubric: true });
+    expect(p).toContain("## Shared rubric");
+    // Fail-fast + untrusted-input + callouts all present.
+    expect(p).toContain("Fail-fast error handling");
+    expect(p).toContain("Untrusted user input");
+    expect(p).toContain("callouts");
+    // Order: procedure comes before the rubric block.
+    expect(p.indexOf("Procedure —")).toBeLessThan(
+      p.indexOf("## Shared rubric"),
+    );
+    // Output contract still present and after the rubric.
+    expect(p.indexOf("## Shared rubric")).toBeLessThan(
+      p.indexOf("Respond with ONE JSON object"),
+    );
+  });
+
+  it("composes with custom guidance: guidance first, then rubric", () => {
+    const p = buildSystemPrompt({ guidance: "Only hunt bugs.", rubric: true });
+    expect(p.indexOf("Only hunt bugs.")).toBeLessThan(
+      p.indexOf("## Shared rubric"),
+    );
+  });
+
+  it("advertises the callouts field in the output contract", () => {
+    const p = buildSystemPrompt({});
+    expect(p).toContain('"callouts"');
+    expect(p).toContain("migration");
+    expect(p).toContain("feature-flag");
+  });
+});

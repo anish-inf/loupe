@@ -134,6 +134,50 @@ describe("parseReviewOutput concerns/diagram", () => {
   });
 });
 
+describe("parseReviewOutput callouts", () => {
+  it("parses callouts, mapping known kinds and tolerating synonyms and unknowns", () => {
+    const { review: out, malformedCallouts } = parseReviewOutput(
+      JSON.stringify({
+        summary: "s",
+        findings: [],
+        concerns: [],
+        callouts: [
+          { kind: "migration", body: "db/migrations/0007.sql" },
+          { kind: "New-Dependency", body: "added fast-json" },
+          { kind: "lockfile-change", body: "bun.lock touched" },
+          { kind: "auth", body: "route guard moved to middleware" },
+          { kind: "weird-thing", body: "unknown kind kept" },
+          { body: "no kind → other" },
+          { kind: "migration" }, // malformed (no body) → dropped
+        ],
+      }),
+    );
+    expect(out.callouts.map((c) => c.kind)).toEqual([
+      "migration",
+      "new-dependency",
+      "changed-dependency",
+      "auth-permissions",
+      "other",
+      "other",
+    ]);
+    expect(out.callouts[4]?.body).toBe("unknown kind kept");
+    expect(malformedCallouts).toBe(1);
+  });
+
+  it("defaults callouts to an empty array when the field is omitted", () => {
+    const { review: out } = parseReviewOutput(
+      JSON.stringify({ summary: "s", findings: [], concerns: [] }),
+    );
+    expect(out.callouts).toEqual([]);
+  });
+
+  it("rejects a review whose callouts is not an array", () => {
+    expect(() =>
+      parseReviewOutput('{"summary":"s","callouts":"migration"}'),
+    ).toThrow(/not a review/);
+  });
+});
+
 describe("parseVerification", () => {
   it("maps finding index to a verdict when every index is covered once", () => {
     const r = parseVerification(

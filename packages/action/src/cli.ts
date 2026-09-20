@@ -272,6 +272,7 @@ program
                 maxTurns: r.maxTurns ?? maxTurns,
                 priorComments: r.priorComments ?? priorComments,
                 procedure: r.procedure ?? settings.procedure,
+                rubric: r.rubric ?? settings.rubric,
                 dirs: r.dirs ?? dirs,
                 logger,
               });

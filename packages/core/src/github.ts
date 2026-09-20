@@ -3,7 +3,7 @@ import { Octokit } from "@octokit/rest";
 import type { Logger } from "@loupe/logger";
 
 import type { DiffFile } from "./diff";
-import type { Finding, ReviewOutput } from "./types";
+import type { Callout, CalloutKind, Finding, ReviewOutput } from "./types";
 
 export type PullRef = {
   readonly owner: string;
@@ -533,6 +533,31 @@ const SEV_EMOJI: Record<Finding["severity"], string> = {
 };
 
 /**
+ * Human-facing label + emoji for each non-blocking callout kind. Adapted from
+ * pi-review's "Human Reviewer Callouts (Non-Blocking)" section. Callouts are
+ * informational and never affect the verdict; the label makes the summary
+ * scannable for the risks a human reviewer must be aware of (migrations,
+ * dependency churn, auth/permission changes, breaking changes, …).
+ */
+const CALLOUT_LABEL: Record<CalloutKind, string> = {
+  migration: "📦 Database migration",
+  "new-dependency": "➕ New dependency",
+  "changed-dependency": "🔄 Changed dependency / lockfile",
+  "auth-permissions": "🔐 Auth / permission behavior",
+  "breaking-change": "💥 Backwards-incompatible schema/API/contract",
+  "destructive-op": "⚠️ Irreversible / destructive operation",
+  "feature-flag": "🚩 Feature flag added/removed",
+  "config-default": "⚙️ Changed configuration default",
+  other: "ℹ️ Reviewer callout",
+};
+
+function renderCallouts(callouts: readonly Callout[]): string {
+  return callouts
+    .map((c) => `- **${CALLOUT_LABEL[c.kind]}:** ${c.body.trim()}`)
+    .join("\n");
+}
+
+/**
  * How the run went, beyond the findings themselves. Rendered into the summary
  * so a degraded review (fallback, unverified, lossy parse) is visible on the PR
  * instead of only in the Actions log.
@@ -547,6 +572,7 @@ export type ReviewDiagnostics = {
   readonly malformedDropped: {
     readonly findings: number;
     readonly concerns: number;
+    readonly callouts: number;
   };
   /** Findings anchored outside the reassessed files on an incremental run. */
   readonly outOfScopeDropped: number;
@@ -565,7 +591,10 @@ export function isDegraded(d: ReviewDiagnostics): boolean {
     d.verify === "invalid" ||
     d.verify === "failed" ||
     d.incremental === "unknown" ||
-    d.malformedDropped.findings + d.malformedDropped.concerns > 0
+    d.malformedDropped.findings +
+      d.malformedDropped.concerns +
+      d.malformedDropped.callouts >
+      0
   );
 }
 
@@ -576,7 +605,7 @@ function renderDiagnostics(d: ReviewDiagnostics): string {
     }`,
     `- verification: ${d.verify}`,
     `- scope: ${d.incremental}${d.incremental === "unknown" ? " (history lookup failed; prior comments kept)" : ""}`,
-    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification`,
+    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.malformedDropped.callouts} malformed callout(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification`,
     `- off-diff notes published: ${d.offDiff}`,
   ];
   return `<details><summary>Run details</summary>\n\n${rows.join("\n")}\n\n</details>`;
@@ -625,6 +654,15 @@ function renderReviewBody(
             `${SEV_EMOJI[c.severity]} **${c.title}**\n\n${c.detail.trim()}`,
         )
         .join("\n\n")}`,
+    );
+  }
+  // Non-blocking human callouts (migrations, dependency churn, auth/permission,
+  // breaking changes, destructive ops, feature flags, config defaults). These
+  // are informational and never affect the verdict; rendered as a scannable
+  // bullet list under a distinct heading so a human reviewer can't miss them.
+  if (review.callouts.length > 0) {
+    parts.push(
+      `#### Human reviewer callouts (non-blocking)\n\n${renderCallouts(review.callouts)}`,
     );
   }
   if (review.highlights.length > 0) {

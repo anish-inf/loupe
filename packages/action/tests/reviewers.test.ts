@@ -49,3 +49,42 @@ describe("dir setting", () => {
     expect(asDirs(undefined)).toBeUndefined();
   });
 });
+
+describe("rubric setting", () => {
+  it("loads a top-level rubric default and surfaces it on loadSettings", () => {
+    const p = config({
+      rubric: true,
+      reviewers: [{ name: "code", prompt: "x" }],
+    });
+    expect(loadSettings(p).rubric).toBe(true);
+  });
+
+  it("applies the top-level default to reviewers that don't set it", () => {
+    const p = config({
+      rubric: true,
+      reviewers: [
+        { name: "inherits", prompt: "x" },
+        { name: "opts-out", prompt: "y", rubric: false },
+      ],
+    });
+    const [inherits, optsOut] = loadReviewers(p);
+    expect(inherits!.rubric).toBe(true);
+    expect(optsOut!.rubric).toBe(false);
+  });
+
+  it("a reviewer's own value wins over the top-level default", () => {
+    const p = config({
+      rubric: false,
+      reviewers: [{ name: "opts-in", prompt: "x", rubric: true }],
+    });
+    expect(loadReviewers(p)[0]!.rubric).toBe(true);
+  });
+
+  it("defaults to undefined (off) when neither top-level nor reviewer sets it", () => {
+    const p = config({
+      reviewers: [{ name: "code", prompt: "x" }],
+    });
+    expect(loadSettings(p).rubric).toBeUndefined();
+    expect(loadReviewers(p)[0]!.rubric).toBeUndefined();
+  });
+});

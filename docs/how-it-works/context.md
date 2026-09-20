@@ -19,12 +19,13 @@ Order matters for caching. Everything here is identical across PRs for a given r
 
 1. **Guidance.** The reviewer's `prompt` or `promptFile`, verbatim. It replaces loupe's default guidance when set.
 2. **Procedure.** Always appended, even under custom guidance: locate and read the callers of every changed export before judging, follow thin wrappers one more hop, treat a newly interactive or blocking call inside a spinner or other terminal-owning wrapper as a defect. `procedure: false` removes it.
-3. **Skills.** Each path in `skills` is read from the checkout. A directory means its `SKILL.md`. A missing skill logs a warning and is skipped.
-4. **Conventions.** Every convention doc that exists at the PR head, concatenated under `# <path>` headers. Fetched via the GitHub API, not the checkout.
-5. **Reasoning note.** One sentence, only when `reasoning` is configured. The same value goes to the harness natively.
-6. **Profile directive.** Which severities to report.
-7. **Tool directive.** Agentic: you have the checkout, read hunks from the diff file on demand, spend the turn budget on callers and contracts first, use subagents only for genuinely parallel work, then stop and emit JSON. Headless (verify pass, retry, chat): no tools, diff is inline.
-8. **Output contract.** One JSON object, not wrapped in a code fence: `summary`, `concerns[]`, `highlights[]`, optional `diagram`, `findings[]` with `path`, `line` (new-file line, must be in the diff), `severity`, `body`. `summary`, `detail`, and `body` are GitHub Markdown and may hold paragraphs and fenced code blocks.
+3. **Shared rubric.** Appended only when `rubric: true` (per reviewer or as a top-level `.loupe.json` default; off by default). Contributes the fail-fast error-handling rules, the untrusted-input checklist (open redirects, parametrized SQL, SSRF via the DNS resolver, escape-don't-sanitize), the clean-code rules (no duplication, no speculative abstractions, no masking defensive checks), comment discipline (≤1 paragraph, ≤3-line snippets, matter-of-fact tone), and the non-blocking **callouts** contract. Adapted from [earendil-works/pi-review](https://github.com/earendil-works/pi-review). Stable per reviewer, so it stays cache-safe.
+4. **Skills.** Each path in `skills` is read from the checkout. A directory means its `SKILL.md`. A missing skill logs a warning and is skipped.
+5. **Conventions.** Every convention doc that exists at the PR head, concatenated under `# <path>` headers. Fetched via the GitHub API, not the checkout.
+6. **Reasoning note.** One sentence, only when `reasoning` is configured. The same value goes to the harness natively.
+7. **Profile directive.** Which severities to report.
+8. **Tool directive.** Agentic: you have the checkout, read hunks from the diff file on demand, spend the turn budget on callers and contracts first, use subagents only for genuinely parallel work, then stop and emit JSON. Headless (verify pass, retry, chat): no tools, diff is inline.
+9. **Output contract.** One JSON object, not wrapped in a code fence: `summary`, `concerns[]`, `highlights[]`, optional `diagram`, `findings[]` with `path`, `line` (new-file line, must be in the diff), `severity`, `body`, and optional `callouts[]` with `kind` (one of `migration`, `new-dependency`, `changed-dependency`, `auth-permissions`, `breaking-change`, `destructive-op`, `feature-flag`, `config-default`) and `body`. `summary`, `detail`, and `body` are GitHub Markdown and may hold paragraphs and fenced code blocks. Callouts are informational for a human reviewer and never affect the verdict — a callout alone must not drive a request-changes.
 
 ## User message
 

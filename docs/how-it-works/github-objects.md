@@ -54,6 +54,11 @@ Severity emoji: 🔴 blocker, 🟡 warning, 🔵 nit.
 
 <detail>
 
+#### Human reviewer callouts (non-blocking)
+
+- **📦 Database migration:** <files/details>
+- **➕ New dependency:** <package(s)/details>
+
 #### Highlights
 - ✅ ...
 

@@ -308,7 +308,7 @@ describe("runReview end to end", () => {
       mode: "agentic",
       verify: "passed",
       incremental: "delta",
-      malformedDropped: { findings: 0, concerns: 0 },
+      malformedDropped: { findings: 0, concerns: 0, callouts: 0 },
       outOfScopeDropped: 1,
       profileDropped: 0,
       verifyDropped: 0,

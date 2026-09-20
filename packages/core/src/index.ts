@@ -138,6 +138,13 @@ export type ReviewRequest = {
   readonly priorComments?: PriorComments;
   /** Append the always-on review procedure to the system prompt (default true). */
   readonly procedure?: boolean;
+  /**
+   * Append the shared review rubric (fail-fast, untrusted input, clean-code,
+   * comment discipline, non-blocking callouts) to the system prompt. Default
+   * false; opted in per reviewer or as a top-level default in `.loupe.json`.
+   * Stable per reviewer → cache-safe.
+   */
+  readonly rubric?: boolean;
   /** Post inline findings now, but let the caller aggregate the summary. */
   readonly deferSummary?: boolean;
   /**
@@ -167,7 +174,7 @@ const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
   mode: "agentic",
   verify: "skipped",
   incremental: "full",
-  malformedDropped: { findings: 0, concerns: 0 },
+  malformedDropped: { findings: 0, concerns: 0, callouts: 0 },
   outOfScopeDropped: 0,
   profileDropped: 0,
   verifyDropped: 0,
@@ -329,6 +336,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     profile,
     skills,
     procedure: req.procedure,
+    rubric: req.rubric,
     conventions: conventions.text,
   };
   const systemPrompt = buildSystemPrompt({ ...promptOpts, agentic });
@@ -409,6 +417,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     mode: (agentic ? "agentic" : "headless") as ReviewDiagnostics["mode"],
     malformedFindings: 0,
     malformedConcerns: 0,
+    malformedCallouts: 0,
     outOfScope: 0,
     profileDropped: 0,
   };
@@ -468,6 +477,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     }
     counts.malformedFindings += parsed.malformedFindings;
     counts.malformedConcerns += parsed.malformedConcerns;
+    counts.malformedCallouts += parsed.malformedCallouts;
     // Incremental runs reassess only the focus files; a finding anchored on a
     // context file would duplicate a prior comment we deliberately kept.
     const inScope = parsed.review.findings.filter((f) => focus.has(f.path));
@@ -536,6 +546,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     malformedDropped: {
       findings: counts.malformedFindings,
       concerns: counts.malformedConcerns,
+      callouts: counts.malformedCallouts,
     },
     outOfScopeDropped: counts.outOfScope,
     profileDropped: counts.profileDropped,

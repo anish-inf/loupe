@@ -43,6 +43,7 @@ whose globs match a changed file and posts each as its own labeled review
 | `ensemble` | no | `["kimi-k3","glm-5.2-fast"]` — run several models, keep findings a majority agree on. |
 | `skills` | no | Paths to skill docs (a `SKILL.md` or a skill dir) folded into the reviewer, e.g. `[".agents/skills/i-have-adhd"]` to enforce a terse output style. |
 | `procedure` | no | `false` drops the always-on review procedure (caller check, wrapper rule) from this reviewer's prompt. Also a top-level default. |
+| `rubric` | no | `true` appends the shared review rubric (fail-fast error handling, untrusted-input checklist, clean-code rules, comment discipline, and the non-blocking **callouts** contract — see below) to this reviewer's prompt. Also a top-level default. Off by default so existing reviewers keep their behavior. |
 | `priorComments` | no | What happens to this reviewer's earlier inline comments on a re-review: `resolve` (default: resolve the thread, history kept) \| `delete` \| `keep` (leave them, new comments accumulate). Also a top-level default and the `prior-comments` Action input / `--prior-comments` flag. |
 
 Globs are matched against repo-relative paths. `include` composes with `dir`.
@@ -76,11 +77,75 @@ Every review's system prompt is assembled from:
 
 1. **Reviewer guidance** — the persona/priorities. Default is a high-signal
    senior-reviewer prompt; a reviewer's `prompt`/`promptFile` (or `--prompt-file`)
-   replaces this layer only.
+   replaces this layer only. Two opt-in blocks may follow the guidance: the
+   always-on **review procedure** (`procedure: false` to drop) and, when
+   `rubric: true`, the **shared review rubric** (see below).
 2. **Reasoning note** — from `reasoning` / `--reasoning`.
 3. **Tool directive + output contract** — always appended by loupe. This is why
    a custom prompt can never break JSON parsing or change tool behavior. Write
    only persona/priorities in a custom prompt, never the JSON schema.
+
+## Shared review rubric (`rubric`)
+
+Opt in per reviewer or as a top-level default:
+
+```json
+{ "rubric": true, "reviewers": [ { "name": "code", "rubric": true } ] }
+```
+
+When on, loupe appends a shared rubric (adapted from
+[earendil-works/pi-review](https://github.com/earendil-works/pi-review)) after
+the guidance and procedure. It contributes rules reviewers would otherwise have
+to restate in every custom prompt:
+
+- **Determining what to flag** — only issues introduced by the change, discrete
+  and actionable, with provable impact on named parts (no speculation, no
+  pre-existing bugs, no rigor inconsistent with the rest of the codebase).
+- **Fail-fast error handling** — prefer propagation over local recovery; flag
+  `catch` blocks that return `null`/`[]`/`false` or swallow JSON parse failures;
+  boundary handlers may translate errors but never pretend success.
+- **Untrusted user input** — open redirects pinned to trusted domains,
+  parametrized SQL, SSRF protection on user-supplied URLs (intercept the DNS
+  resolver), escape-don't-sanitize.
+- **Clean-code** — flag duplication (name the existing impl), one-off helpers
+  that add indirection, speculative abstractions, defensive checks masking
+  invariant violations.
+- **Comment discipline** — ≤1 paragraph, snippets <3 lines, matter-of-fact tone,
+  no flattery.
+- **Non-blocking callouts** — the `callouts` output field (see below).
+
+It composes with the noise profile (the profile still hard-filters severities)
+and is stable per reviewer, so it stays cache-safe.
+
+## Non-blocking callouts
+
+A reviewer may emit a `callouts` array alongside `findings` and `concerns` for
+informational risks a human reviewer should be aware of but that are **not** fix
+items:
+
+| `kind` | When to use |
+|---|---|
+| `migration` | A database migration is added or changed. |
+| `new-dependency` | A new dependency is introduced. |
+| `changed-dependency` | A dependency or the lockfile changes. |
+| `auth-permissions` | Auth or permission behavior changes. |
+| `breaking-change` | A backwards-incompatible public schema/API/contract change. |
+| `destructive-op` | An irreversible or destructive operation. |
+| `feature-flag` | A feature flag is added/removed (call out reuse of a dormant flag!). |
+| `config-default` | A configuration default changes. |
+
+Rules:
+
+- Informational for the human reviewer, not fix items. Do not duplicate a
+  callout as a finding unless there is an independent defect.
+- A callout alone must never change the verdict or make a review
+  `REQUEST_CHANGES`. Only a blocking `finding` does that.
+- Include only callouts that apply to the change; omit the array when none do.
+
+Loupe renders callouts under a distinct **"Human reviewer callouts
+(non-blocking)"** section in the summary, with an emoji + label per kind. Unknown
+`kind` values are kept (rendered as a generic callout) so a model that invents a
+reasonable kind still reaches the human.
 
 ## Agentic vs one-shot
 
@@ -164,7 +229,11 @@ updating that comment in place on every re-review so stale summaries do not
 accumulate in the timeline.
 
 - **Summary comment** — a stat line (🔴/🟡/🔵 counts · files), the summary, a
-  **Concerns** section (PR-level risks not tied to a line), optional
+  **Concerns** section (PR-level risks not tied to a line), an optional
+  **Human reviewer callouts (non-blocking)** section (migrations, dependency
+  churn, auth/permission changes, breaking changes, destructive ops, feature
+  flags, changed config defaults — informational, never affects the verdict;
+  emitted when `rubric: true` reviewers use the `callouts` field), optional
   **Highlights**, an optional Mermaid diagram (only for a genuinely complex
   flow), and an "Other notes" section for findings that couldn't be anchored.
 - **Inline comments** — one per `finding`, on the exact diff line. If the model's

@@ -9,7 +9,7 @@ const diagnostics = {
   mode: "agentic" as const,
   verify: "skipped" as const,
   incremental: "full" as const,
-  malformedDropped: { findings: 0, concerns: 0 },
+  malformedDropped: { findings: 0, concerns: 0, callouts: 0 },
   outOfScopeDropped: 0,
   profileDropped: 0,
   verifyDropped: 0,

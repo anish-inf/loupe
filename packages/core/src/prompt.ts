@@ -58,6 +58,90 @@ Severity rubric:
 - "nit": minor, optional, or stylistic. Use sparingly.`.trim();
 
 /**
+ * Optional shared rubric (adapted from earendil-works/pi-review). A set of
+ * high-signal, fail-fast, and untrusted-input rules that are valuable for almost
+ * any reviewer but noisy to repeat in every custom prompt. Folded in after the
+ * guidance and the procedure. Turn on with `rubric: true` (per reviewer or as a
+ * top-level default in `.loupe.json`); off by default so existing reviewers keep
+ * their current behavior.
+ *
+ * The rubric deliberately says what to FLAG and, just as importantly, what NOT
+ * to flag (no speculation, no pre-existing bugs, no style) so it composes with
+ * the noise profile rather than fighting it.
+ */
+const SHARED_RUBRIC = `
+## Shared rubric (applies in addition to the reviewer's own guidance)
+
+### Determining what to flag
+- Flag issues that meaningfully impact correctness, performance, security, or
+  maintainability, that are discrete and actionable, and that the author would
+  fix if aware of them.
+- Were introduced in the changes being reviewed — not pre-existing bugs.
+- Demand no rigor inconsistent with the rest of the codebase.
+- Do not rely on unstated assumptions about the author's intent.
+- Have provable impact on other parts of the code — it is not enough to
+  speculate that a change *may* disrupt another part; name the parts that are
+  provably affected or drop it.
+
+### Fail-fast error handling (strict)
+When reviewing added or modified error handling, default to fail-fast behavior:
+- Evaluate every new or changed \`try/catch\`: identify what can fail and why
+  local handling is correct at that exact layer.
+- Prefer propagation over local recovery. If the current scope cannot fully
+  recover while preserving correctness, rethrow (optionally with context)
+  instead of returning a fallback.
+- Flag catch blocks that hide failure signals: returning \`null\`/\`[]\`/\`false\`,
+  swallowing JSON parse failures, logging-and-continue, or "best effort" silent
+  recovery.
+- JSON parsing/decoding should fail loudly by default. Quiet fallback parsing is
+  only acceptable with an explicit compatibility requirement.
+- Boundary handlers (HTTP routes, CLI entrypoints, supervisors) may translate
+  errors, but must not pretend success or silently degrade.
+- If a catch exists only to satisfy lint/style without real handling, treat it
+  as a bug. When uncertain, prefer crashing fast over silent degradation.
+
+### Untrusted user input
+- Open redirects must always be checked to only go to trusted domains
+  (\`?next_page=…\`).
+- Always flag SQL that is not parametrized.
+- In systems with user-supplied URL input, http fetches must be protected
+  against access to local resources (intercept the DNS resolver for SSRF).
+- Escape, don't sanitize, when you have the option (e.g. HTML escaping).
+
+### Clean-code
+- Check whether each newly added function duplicates existing functionality
+  elsewhere; flag actual duplication and name the existing implementation.
+- Flag one-off helpers that add indirection without improving clarity or reuse.
+- Flag abstractions introduced without a concrete need in this change, including
+  wrappers created only for hypothetical future use.
+- Flag defensive checks or fallback behavior that mask programming errors,
+  especially when callers already guarantee the invariant.
+
+### Comment discipline (how to write each finding/concern body)
+- Be clear about why the issue is a problem. Communicate severity appropriately
+  — don't exaggerate.
+- Be brief — at most 1 paragraph. Keep code snippets under 3 lines, wrapped in
+  inline code or code blocks.
+- Use a matter-of-fact tone — helpful, not accusatory. No flattery, no
+  "great job…", no preamble.
+- Explicitly state the scenario/environment where the issue arises when it is
+  not obvious from the diff.
+
+### Non-blocking human callouts
+After your findings, you MAY append a \`callouts\` array (see the output
+contract) for informational risks a human reviewer should be aware of but that
+are NOT fix items: a database migration, a new/changed dependency, auth or
+permission behavior changes, backwards-incompatible schema/API/contract changes,
+irreversible or destructive operations, added/removed feature flags (call out
+reuse of dormant flags!), or changed configuration defaults.
+Rules for callouts:
+1. Informational for the human reviewer, not fix items. Do not duplicate a
+   callout as a finding unless there is an independent defect.
+2. A callout alone must never change the verdict or make a review request changes.
+3. Include only callouts that apply to this change; if none apply, omit the
+   array (or send \`[]\`).`.trim();
+
+/**
  * Always-on review procedure. Appended after the guidance whether or not a
  * custom prompt replaced the default, because custom reviewer prompts describe
  * WHAT to look for and routinely omit HOW to check it. Consumers turn it off
@@ -106,12 +190,22 @@ Schema:
       "severity": "blocker" | "warning" | "nit",
       "body": "<the problem on THIS line and the fix>"
     }
+  ],
+  "callouts": [
+    {
+      "kind": "<one of: migration | new-dependency | changed-dependency | auth-permissions | breaking-change | destructive-op | feature-flag | config-default>",
+      "body": "<what changed and where — informational, not a fix item>"
+    }
   ]
 }
 PREFER "findings" — if an issue relates to specific line(s), emit it as a finding
 with the diff line number (it becomes an inline comment). Reserve "concerns" for
-truly PR-wide issues with no line to point at. Empty arrays when nothing to say.
-"highlights" usually empty.`.trim();
+truly PR-wide issues with no line to point at. Use "callouts" ONLY for
+non-blocking human-reviewer notices (migrations, dependency churn, auth/permission
+changes, breaking schema/API, destructive ops, feature-flag changes, changed
+config defaults) — never as fix items, and a callout alone must never change the
+verdict. Empty arrays when nothing to say. "highlights" usually empty. Omit
+"callouts" entirely when none apply.`.trim();
 
 const PROFILE_DIRECTIVE: Record<Profile, string> = {
   quiet:
@@ -166,6 +260,10 @@ export function buildSystemPrompt(opts: {
   skills?: readonly string[];
   /** Append the always-on review procedure (default true). */
   procedure?: boolean;
+  /** Append the shared review rubric (fail-fast, untrusted input, clean-code,
+   * comment discipline, callouts). Default false; opted in per reviewer or as a
+   * top-level default in `.loupe.json`. Stable per reviewer → cache-safe. */
+  rubric?: boolean;
   /** Repo convention docs (CLAUDE.md/AGENTS.md/…). Stable per repo → kept in the
    * system prompt so it stays a cacheable prefix across PRs. */
   conventions?: string;
@@ -184,6 +282,7 @@ export function buildSystemPrompt(opts: {
   return [
     opts.guidance?.trim() || DEFAULT_REVIEW_GUIDANCE,
     opts.procedure === false ? "" : REVIEW_PROCEDURE,
+    opts.rubric ? SHARED_RUBRIC : "",
     skillsBlock,
     conventionsBlock,
     opts.reasoning ? REASONING_NOTE[opts.reasoning] : "",
