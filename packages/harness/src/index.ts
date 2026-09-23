@@ -5,9 +5,16 @@ import { join } from "node:path";
 
 import type { Logger } from "@loupe/logger";
 
+import { HarnessError, classifyHarnessError } from "./errors";
 import type { HarnessTraceEvent } from "./trace";
 import { envSecretValues, redactSecrets } from "./trace";
 
+export {
+  HarnessError,
+  classifyHarnessError,
+  isNonRetryableHarnessError,
+  type HarnessErrorKind,
+} from "./errors";
 export * from "./trace";
 
 /**
@@ -146,7 +153,9 @@ function runCli(
     });
     child.on("error", (err) => {
       emit({ type: "error", error: err.message });
-      reject(err);
+      reject(
+        new HarnessError(err instanceof Error ? err.message : String(err)),
+      );
     });
     child.on("close", (code) => {
       log.debug("Harness exited", { code, stdoutChars: stdout.length });
@@ -155,9 +164,9 @@ function runCli(
         emit({ type: "done", text: stdout });
         resolve(stdout);
       } else {
-        const error = `${cmd} exited ${code}: ${stderr.slice(0, 2000)}`;
-        emit({ type: "error", error });
-        reject(new Error(error));
+        const message = `${cmd} exited ${code}: ${stderr.slice(0, 2000)}`;
+        emit({ type: "error", error: message });
+        reject(new HarnessError(message, classifyHarnessError(message)));
       }
     });
     child.stdin.write(stdin);
@@ -309,9 +318,11 @@ function runWhipStreaming(
         case "done":
           final = typeof event["text"] === "string" ? event["text"] : text;
           break;
-        case "error":
-          reject(new Error(`whip error: ${JSON.stringify(event["error"])}`));
+        case "error": {
+          const message = `whip error: ${JSON.stringify(event["error"])}`;
+          reject(new HarnessError(message, classifyHarnessError(message)));
           break;
+        }
         default:
           log.debug("event", event);
       }
@@ -328,13 +339,18 @@ function runWhipStreaming(
       stderr += chunk;
       log.debug(chunk.trimEnd());
     });
-    child.on("error", reject);
+    child.on("error", (e) =>
+      reject(new HarnessError(e instanceof Error ? e.message : String(e))),
+    );
     child.on("close", (code) => {
       if (buffer.trim()) handle(buffer);
       const out = final ?? text;
       log.debug("Harness exited", { code, replyChars: out.length });
       if (code === 0) resolve(out);
-      else reject(new Error(`whip exited ${code}: ${stderr.slice(0, 2000)}`));
+      else {
+        const message = `whip exited ${code}: ${stderr.slice(0, 2000)}`;
+        reject(new HarnessError(message, classifyHarnessError(message)));
+      }
     });
     child.stdin.write(ctx.userPrompt);
     child.stdin.end();

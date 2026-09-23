@@ -235,7 +235,7 @@ function readCommentBody(eventPath: string): string | undefined {
 export async function handleComment(
   config: Config,
   logger: Logger,
-): Promise<void> {
+): Promise<readonly ReviewerOutcome[] | undefined> {
   if (!config.eventPath) return;
   const body = readCommentBody(config.eventPath);
   if (!body || !MENTION.test(body)) {
@@ -263,10 +263,12 @@ export async function handleComment(
       ref,
       "🔍 On it — re-reviewing this PR.",
     );
+    let outcomes: readonly ReviewerOutcome[] | undefined;
     try {
       // Reviewer failures are already reported per reviewer by runReviews;
-      // only a setup error reaches the catch below.
-      const outcomes = await runReviews(config, logger, true);
+      // only a setup error reaches the catch below. Outcomes are returned so
+      // main() can surface the run's status even when summary posting throws.
+      outcomes = await runReviews(config, logger, true);
       if (outcomes.some((o) => !o.ok)) process.exitCode = 1;
       const { data: pr } = await octokit.pulls.get(ref);
       await updateIssueComment(
@@ -287,8 +289,14 @@ export async function handleComment(
           ? `⚠️ Re-review finished, but Loupe could not publish the combined summary — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`
           : `⚠️ Loupe could not complete the re-review — ${reason.slice(0, 500)}\n\nSee the Actions run logs for details.`,
       );
+      // Re-throw so main()'s .catch writes status (failed, or the recovered
+      // reviewer kind for a quota/rate-limit failure whose summary post threw).
+      // Without this, a chat review that fails to start leaves status empty —
+      // the same silent-green gap this PR targets, since exitCode=1 is masked
+      // by the default continue-on-error: true.
+      throw err;
     }
-    return;
+    return outcomes;
   }
 
   const fixMatch = /^fix\b[:\s]*(.*)/is.exec(instruction);

@@ -4,6 +4,7 @@ import {
   upsertCombinedSummary,
   type ReviewResult,
 } from "@loupe/core";
+import { HarnessError, type HarnessErrorKind } from "@loupe/harness";
 import type { Logger } from "@loupe/logger";
 
 import type { Config } from "./config";
@@ -17,16 +18,26 @@ import {
 
 /** What one reviewer did: its result, or the failure that was reported on the PR. */
 export class CombinedSummaryPublicationError extends Error {
-  constructor(cause: unknown) {
+  /** The reviewer outcomes from the completed run, recoverable when the
+   * combined summary failed to post so a caller can still surface status. */
+  readonly outcomes: readonly ReviewerOutcome[];
+  constructor(cause: unknown, outcomes: readonly ReviewerOutcome[]) {
     super(cause instanceof Error ? cause.message : String(cause));
     this.name = "CombinedSummaryPublicationError";
     this.cause = cause;
+    this.outcomes = outcomes;
   }
 }
 
 export type ReviewerOutcome =
   | { readonly name: string; readonly ok: true; readonly result: ReviewResult }
-  | { readonly name: string; readonly ok: false; readonly error: string };
+  | {
+      readonly name: string;
+      readonly ok: false;
+      readonly error: string;
+      /** The classified HarnessError kind, if the failure was a harness error. */
+      readonly kind?: HarnessErrorKind;
+    };
 
 /**
  * Run one reviewer, reporting its own failure on the PR so a broken reviewer
@@ -51,7 +62,13 @@ async function runOne(
     return { name: label, ok: true, result };
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
-    logger.error(`[${label}] review failed`, { error: reason });
+    // The harness already classified its own failures when it built the
+    // HarnessError, so carry that kind through. Don't re-classify arbitrary
+    // error strings here — an Octokit 402/429 or a config error mentioning
+    // "billing" would otherwise be misrouted to a quota/rate-limit status a
+    // workflow routes to #billing. Non-harness failures stay undefined (failed).
+    const kind = err instanceof HarnessError ? err.kind : undefined;
+    logger.error(`[${label}] review failed`, { error: reason, kind });
     try {
       await postIssueComment(
         makeOctokit(config.token, logger),
@@ -67,7 +84,7 @@ async function runOne(
         error: postErr instanceof Error ? postErr.message : String(postErr),
       });
     }
-    return { name: label, ok: false, error: reason };
+    return { name: label, ok: false, error: reason, kind };
   }
 }
 
@@ -232,7 +249,9 @@ export async function runReviews(
       renderCombinedSummary(outcomes),
     );
   } catch (err) {
-    throw new CombinedSummaryPublicationError(err);
+    // The reviewers already finished; carry their outcomes so a caller can
+    // still surface the run's status even when the summary failed to post.
+    throw new CombinedSummaryPublicationError(err, outcomes);
   }
   return outcomes;
 }

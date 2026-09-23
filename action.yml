@@ -79,6 +79,10 @@ inputs:
     description: "What to do with loupe's prior inline comments on a re-review: resolve (default), delete, or keep. Overrides .loupe.json."
     required: false
     default: ""
+outputs:
+  status:
+    description: "Review outcome a workflow can branch on: ok | quota | rate-limit | failed."
+    value: ${{ steps.loupe-run.outputs.status }}
 runs:
   using: "composite"
   steps:
@@ -88,7 +92,8 @@ runs:
     - shell: bash
       working-directory: ${{ github.action_path }}
       run: bun install --frozen-lockfile
-    - shell: bash
+    - id: loupe-run
+      shell: bash
       working-directory: ${{ github.action_path }}
       env:
         GITHUB_TOKEN: ${{ inputs.github-token }}

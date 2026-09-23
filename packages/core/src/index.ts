@@ -8,8 +8,13 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { Harness, WhipConfig } from "@loupe/harness";
-import type { HarnessTraceEvent } from "@loupe/harness";
+import {
+  HarnessError,
+  isNonRetryableHarnessError,
+  type Harness,
+  type HarnessTraceEvent,
+  type WhipConfig,
+} from "@loupe/harness";
 import type { Logger } from "@loupe/logger";
 import type { Octokit } from "@octokit/rest";
 import picomatch from "picomatch";
@@ -479,9 +484,15 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     try {
       parsed = await run(agentic, model ? `${tag}:${model}` : tag);
     } catch (err) {
-      if (!agentic) throw err;
+      // Agentic runs can run away (hit the tool-turn cap) or otherwise fail;
+      // fall back to a one-shot diff-only review so we still post something.
+      // A quota/rate-limit failure is not helped by switching modes (same
+      // provider, same billing/throttle), so re-throw immediately instead of
+      // spending a second doomed call per reviewer.
+      if (!agentic || isNonRetryableHarnessError(err)) throw err;
       logger.warn("Agentic review failed; retrying one-shot from the diff", {
         error: err instanceof Error ? err.message : String(err),
+        kind: err instanceof HarnessError ? err.kind : undefined,
       });
       counts.mode = "fallback";
       parsed = await run(false, model ? `fallback:${model}` : "fallback");
