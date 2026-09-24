@@ -662,11 +662,15 @@ function renderDiagnostics(d: ReviewDiagnostics): string {
         ? ` (${d.salvagedFindings} salvaged from malformed finding(s))`
         : ""
     }`,
-    `- ensemble: ${
-      d.degradedLegs.length > 0
-        ? `⚠️ degraded — ${d.degradedLegs.length} model(s) failed and dropped: ${d.degradedLegs.join(", ")}`
-        : "all models completed"
-    }`,
+    // Only surface an ensemble row when a leg was actually lost. A clean
+    // ensemble has nothing to flag, and a non-ensemble run has no ensemble to
+    // report on — rendering "all models completed" for either would be noise
+    // (and a plain single-model review isn't an ensemble at all).
+    ...(d.degradedLegs.length > 0
+      ? [
+          `- ensemble: ⚠️ degraded — ${d.degradedLegs.length} model(s) failed and dropped: ${d.degradedLegs.join(", ")}`,
+        ]
+      : []),
   ];
   return `<details><summary>Run details</summary>\n\n${rows.join("\n")}\n\n</details>`;
 }
