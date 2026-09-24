@@ -608,6 +608,7 @@ describe("summary rendering", () => {
           verifyDropped: 0,
           offDiff: 1,
           salvagedFindings: 0,
+          degradedLegs: [],
         },
       },
     );
@@ -643,6 +644,7 @@ describe("summary rendering", () => {
           verifyDropped: 0,
           offDiff: 1,
           salvagedFindings: 1,
+          degradedLegs: [],
         },
       },
     );
