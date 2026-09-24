@@ -66,6 +66,7 @@ const result: ReviewResult = {
     verifyDropped: 0,
     offDiff: 0,
     salvagedFindings: 0,
+    degradedLegs: [],
   },
 };
 vi.mock("../src/run", () => ({

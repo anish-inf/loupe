@@ -199,6 +199,7 @@ const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
   verifyDropped: 0,
   offDiff: 0,
   salvagedFindings: 0,
+  degradedLegs: [],
 };
 
 /** End-to-end: fetch PR + conventions, run the harness, post the review. */
@@ -519,8 +520,13 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
         error: err instanceof Error ? err.message : String(err),
         kind: err instanceof HarnessError ? err.kind : undefined,
       });
-      counts.mode = "fallback";
+      // Set the fallback mode only once the headless retry actually resolves.
+      // In an ensemble, this runs per leg against shared counts; a leg that
+      // dies on the fallback too must not leave "fallback" behind to taint the
+      // survivors' mode (otherwise a fully-agentic survivor review renders as
+      // "headless fallback (agentic run failed)" in Run details).
       parsed = await run(false, model ? `fallback:${model}` : "fallback");
+      counts.mode = "fallback";
     }
     counts.malformedFindings += parsed.malformedFindings;
     counts.malformedConcerns += parsed.malformedConcerns;
@@ -554,16 +560,42 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   let uncertain: Finding[] = [];
   let verify: ReviewDiagnostics["verify"] = "skipped";
   let verifyDropped = 0;
+  // Models that failed and were dropped from an ensemble merge so the
+  // surviving legs' findings still post. Stays empty for a non-ensemble run or
+  // a fully-successful one; populated per leg below. Surfaced on the summary as
+  // a degraded-run note so a lost leg never reads as silence.
+  let failedLegs: string[] = [];
 
   if (ensemble) {
     logger.info("Ensemble review", { models: ensemble });
-    const [firstModel, ...restModels] = ensemble;
-    const firstRun = await produceOne(firstModel, "ensemble");
-    const runs = [firstRun];
-    for (const model of restModels)
-      runs.push(await produceOne(model, "ensemble")); // sequential
-    review = firstRun.review;
-    dropped = firstRun.dropped;
+    const runs: { inline: Finding[]; review: ReviewOutput; dropped: Note[] }[] =
+      [];
+    for (const model of ensemble) {
+      try {
+        runs.push(await produceOne(model, "ensemble"));
+      } catch (err) {
+        const legModel = model ?? "(harness default)";
+        failedLegs.push(legModel);
+        logger.warn("Ensemble leg failed; degrading to remaining models", {
+          model: legModel,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // Borrow the review body (summary/concerns/highlights) from the first
+    // surviving leg, not the first configured leg — the first leg may be one
+    // that failed. If no leg survived, let the reviewer-level failure path post
+    // the ⚠️ comment and exit 1 rather than posting a vacuous "clean" review.
+    const [firstSurvivor] = runs;
+    if (!firstSurvivor) {
+      throw new Error(`all ensemble models failed: ${failedLegs.join(", ")}`);
+    }
+    review = firstSurvivor.review;
+    dropped = firstSurvivor.dropped;
+    // Keep the majority threshold relative to the configured panel, not the
+    // survivors: a lone survivor's findings have models.size < threshold and
+    // flow into the existing lower-confidence section — the honest claim for a
+    // degraded ensemble, never a false "majority confirmed".
     const merged = mergeEnsemble(
       runs.map((r) => r.inline),
       majority(ensemble.length),
@@ -573,6 +605,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     logger.info("Ensemble merged", {
       confirmed: inline.length,
       uncertain: uncertain.length,
+      degradedLegs: failedLegs,
     });
   } else {
     const one = await produceOne(req.model);
@@ -607,6 +640,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     verifyDropped,
     offDiff: dropped.length,
     salvagedFindings: counts.salvagedFindings,
+    degradedLegs: failedLegs,
   };
 
   // Ensemble minority findings go in a collapsed lower-confidence section.

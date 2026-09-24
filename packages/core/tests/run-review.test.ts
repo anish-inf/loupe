@@ -15,7 +15,7 @@ import type {
 } from "@loupe/harness";
 import { describe, expect, it, vi } from "vitest";
 
-import { runReview, type ReviewRequest } from "../src/index";
+import { isDegraded, runReview, type ReviewRequest } from "../src/index";
 
 const ref = { owner: "acme", repo: "app", pull_number: 7 };
 const SHA_A = "a".repeat(40);
@@ -266,6 +266,48 @@ function fakeHarness(script: {
   return { harness, contexts };
 }
 
+/**
+ * A harness that scripts each model independently, so an ensemble can have one
+ * leg throw and another succeed. A model whose script is an Error throws on
+ * EVERY call (agentic and the headless fallback alike) so produceOne's own
+ * agentic→one-shot retry also fails and the throw propagates to the ensemble
+ * loop — the shape of a real timeout/quota death. A string script answers that
+ * model's agentic review; non-agentic calls (verify) return "".
+ */
+function fakePerModelHarness(byModel: Record<string, string | Error>): {
+  harness: Harness;
+  contexts: HarnessContext[];
+} {
+  const contexts: HarnessContext[] = [];
+  const harness: Harness = {
+    name: "fake",
+    credentialKeys: [],
+    available: async () => true,
+    review: async (ctx) => {
+      contexts.push(ctx);
+      const script = ctx.model ? byModel[ctx.model] : undefined;
+      if (script instanceof Error) {
+        ctx.trace?.({
+          type: "error",
+          error: script.message,
+          model: ctx.model,
+          phase: ctx.phase,
+        });
+        throw script;
+      }
+      const output = ctx.agentic ? String(script ?? reviewJson([])) : "";
+      ctx.trace?.({
+        type: "done",
+        text: output,
+        model: ctx.model,
+        phase: ctx.phase,
+      });
+      return output;
+    },
+  };
+  return { harness, contexts };
+}
+
 function request(
   api: ReturnType<typeof fakeOctokit>,
   harness: Harness,
@@ -361,6 +403,7 @@ describe("runReview end to end", () => {
       verifyDropped: 0,
       offDiff: 0,
       salvagedFindings: 0,
+      degradedLegs: [],
     });
 
     // Only B's prior thread resolved, and only after review + summary posted.
@@ -496,6 +539,154 @@ describe("runReview end to end", () => {
     expect(events.some((event) => event.phase?.startsWith("verify"))).toBe(
       false,
     );
+  });
+
+  it("ensemble with one failing leg degrades to the survivors and flags degraded", async () => {
+    // Three models, one fails: the two survivors both flag the same finding, so
+    // it clears the 2-of-3 majority and posts inline; the run is flagged
+    // degraded because a leg was lost.
+    const api = fakeOctokit({});
+    const { harness, contexts } = fakePerModelHarness({
+      "model-a": reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
+      ]),
+      "model-b": reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
+      ]),
+      "model-c": new Error("whip error: context deadline exceeded"),
+    });
+    const events: HarnessTraceEvent[] = [];
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b", "model-c"],
+        trace: (event) => events.push(event),
+      }),
+    );
+
+    // Every leg was attempted; the failed one emitted an error on its agentic
+    // pass and again on produceOne's headless fallback (a plain Error isn't a
+    // non-retryable HarnessError, so the fallback fires and also dies) before the
+    // ensemble loop caught it. Only the survivors' majority-confirmed finding
+    // posts inline.
+    expect(events.map((e) => `${e.phase}:${e.type}`)).toEqual([
+      "ensemble:model-a:done",
+      "ensemble:model-b:done",
+      "ensemble:model-c:error",
+      "fallback:model-c:error",
+    ]);
+    expect(result.inline.map((f) => `${f.path}:${f.line}`)).toEqual([
+      "svc/a.ts:2",
+    ]);
+    expect(result.diagnostics.degradedLegs).toEqual(["model-c"]);
+    expect(isDegraded(result.diagnostics)).toBe(true);
+    // Exactly four harness calls: one agentic per leg (3), plus produceOne's
+    // headless fallback for the dead leg (a plain Error isn't non-retryable, so
+    // the fallback fires and also dies). Ensembles skip the verify pass.
+    expect(contexts.length).toBe(4);
+  });
+
+  it("a lone surviving ensemble leg lands in lower-confidence, not inline-confirmed", async () => {
+    // Two models, one fails: the single survivor is below the 2-of-2 majority,
+    // so its finding flows into the lower-confidence section rather than being
+    // falsely labeled majority-confirmed. That is the honest claim for a
+    // degraded ensemble, and the run is still flagged degraded.
+    const api = fakeOctokit({});
+    const { harness } = fakePerModelHarness({
+      "model-a": reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
+      ]),
+      "model-b": new Error("whip error: context deadline exceeded"),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+      }),
+    );
+
+    expect(result.inline).toEqual([]);
+    expect(result.droppedCount).toBe(0);
+    expect(result.diagnostics.degradedLegs).toEqual(["model-b"]);
+    expect(isDegraded(result.diagnostics)).toBe(true);
+    // The survivor's finding lands in the lower-confidence section of the posted
+    // summary (the honest claim for a single-model "majority"), not inline.
+    expect(result.summaryBody).toContain(
+      "Lower-confidence findings (raised by a minority of models)",
+    );
+    expect(result.summaryBody).toContain("svc/a.ts:2");
+  });
+
+  it("a leg that dies on the headless fallback does not taint the survivors' mode", async () => {
+    // Bugbot: a dead leg sets counts.mode = "fallback" before its headless
+    // retry, then the retry throws too — leaving "fallback" on shared counts.
+    // The surviving leg ran agentic and should report mode "agentic", not the
+    // dead leg's "fallback". The error script throws on every call, so the
+    // dead leg's own headless fallback also fails before the loop catches it.
+    const api = fakeOctokit({});
+    const { harness } = fakePerModelHarness({
+      "model-a": reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
+      ]),
+      "model-b": reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
+      ]),
+      "model-c": new Error("model-c died"),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b", "model-c"],
+      }),
+    );
+
+    expect(result.diagnostics.mode).toBe("agentic");
+    expect(result.diagnostics.degradedLegs).toEqual(["model-c"]);
+  });
+
+  it("ensemble where the first leg fails still posts a surviving leg's review", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakePerModelHarness({
+      "model-a": new Error("400 Bad Request: prompt_cache_key"),
+      "model-b": reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
+      ]),
+      "model-c": reviewJson([
+        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
+      ]),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b", "model-c"],
+      }),
+    );
+
+    // The summary/concerns come from the first SURVIVING leg (model-b), not the
+    // first configured leg (model-a) which failed.
+    expect(result.summary).toBe("reviewed");
+    expect(result.inline.map((f) => `${f.path}:${f.line}`)).toEqual([
+      "svc/a.ts:2",
+    ]);
+    expect(result.diagnostics.degradedLegs).toEqual(["model-a"]);
+  });
+
+  it("ensemble where every leg fails throws (no vacuous clean review)", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakePerModelHarness({
+      "model-a": new Error("model-a died"),
+      "model-b": new Error("model-b died"),
+    });
+
+    await expect(
+      runReview(
+        request(api, harness, checkout(), {
+          ensembleModels: ["model-a", "model-b"],
+        }),
+      ),
+    ).rejects.toThrow("all ensemble models failed");
+    // Nothing posted — the reviewer-level failure path handles visibility.
+    expect(api.calls).toEqual([]);
   });
 
   it("promptCache:true (default) stamps a stable cache key on every call", async () => {

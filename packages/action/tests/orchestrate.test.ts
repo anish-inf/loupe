@@ -14,6 +14,7 @@ const diagnostics = {
   verifyDropped: 0,
   offDiff: 0,
   salvagedFindings: 0,
+  degradedLegs: [],
 };
 type OkOutcome = { name: string; ok: true; result: ReviewResult };
 const clean = (name: string): OkOutcome => ({

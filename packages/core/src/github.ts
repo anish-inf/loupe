@@ -627,6 +627,13 @@ export type ReviewDiagnostics = {
   readonly offDiff: number;
   /** Schema-rejected findings kept as notes instead of dropped. */
   readonly salvagedFindings: number;
+  /**
+   * Ensemble models that failed and were dropped from the merge so the
+   * surviving legs' findings still post. Empty (and undefined semantically)
+   * for a non-ensemble or fully-successful run; names the failed model ids
+   * otherwise, so the summary can flag the review as degraded.
+   */
+  readonly degradedLegs: readonly string[];
 };
 
 /** True when the run lost or skipped something the reader should know about. */
@@ -637,7 +644,8 @@ export function isDegraded(d: ReviewDiagnostics): boolean {
     d.verify === "failed" ||
     d.incremental === "unknown" ||
     d.malformedDropped.findings + d.malformedDropped.concerns > 0 ||
-    d.salvagedFindings > 0
+    d.salvagedFindings > 0 ||
+    d.degradedLegs.length > 0
   );
 }
 
@@ -654,6 +662,15 @@ function renderDiagnostics(d: ReviewDiagnostics): string {
         ? ` (${d.salvagedFindings} salvaged from malformed finding(s))`
         : ""
     }`,
+    // Only surface an ensemble row when a leg was actually lost. A clean
+    // ensemble has nothing to flag, and a non-ensemble run has no ensemble to
+    // report on — rendering "all models completed" for either would be noise
+    // (and a plain single-model review isn't an ensemble at all).
+    ...(d.degradedLegs.length > 0
+      ? [
+          `- ensemble: ⚠️ degraded — ${d.degradedLegs.length} model(s) failed and dropped: ${d.degradedLegs.join(", ")}`,
+        ]
+      : []),
   ];
   return `<details><summary>Run details</summary>\n\n${rows.join("\n")}\n\n</details>`;
 }
