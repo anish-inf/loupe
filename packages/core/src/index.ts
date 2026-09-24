@@ -21,6 +21,7 @@ import picomatch from "picomatch";
 
 import {
   changedFilesBetween,
+  checkPublishable,
   cleanupStrandedThreads,
   fetchConventions,
   fetchPullContext,
@@ -29,6 +30,7 @@ import {
   type PriorComments,
   type PullRef,
   type ReviewDiagnostics,
+  type SkipReason,
 } from "./github";
 import { majority, mergeEnsemble } from "./ensemble";
 import { parseReviewOutput, parseVerification } from "./parse";
@@ -145,6 +147,16 @@ export type ReviewRequest = {
   readonly priorComments?: PriorComments;
   /** Append the always-on review procedure to the system prompt (default true). */
   readonly procedure?: boolean;
+  /**
+   * Send a stable prompt-cache key to the harness so the provider reuses the
+   * cached system prefix across runs. Default true (a real cost win for models
+   * whose endpoint honors it). Set false for a reviewer whose model rejects
+   * `prompt_cache_key` as an unrecognized argument; those models cache the
+   * stable prefix automatically by prefix match, so the key adds nothing and
+   * its presence can 400. The whip harness also self-heals a cache-key 400 by
+   * retrying without the key, so this flag only skips that wasted round-trip.
+   */
+  readonly promptCache?: boolean;
   /** Post inline findings now, but let the caller aggregate the summary. */
   readonly deferSummary?: boolean;
   /**
@@ -168,6 +180,13 @@ export type ReviewResult = {
   readonly summaryBody?: string;
   /** Present only when this run actually reviewed and published the PR head. */
   readonly reviewedHeadSha?: string;
+  /**
+   * Present when findings were computed but not published because the PR was no
+   * longer safe to post onto (merged, closed, or the head moved since the review
+   * started). The reviewer stays silent on GitHub rather than commenting on a
+   * dead diff. See issue #39.
+   */
+  readonly skipped?: { readonly reason: SkipReason };
 };
 
 const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
@@ -424,8 +443,14 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     : headlessUserPrompt;
 
   // Stable prompt-cache key per repo+reviewer so whip reuses the cached system
-  // prefix across runs (and its own turns within a run).
-  const cacheKey = `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}`;
+  // prefix across runs (and its own turns within a run). Omitted when a
+  // reviewer opted out of prompt caching (promptCache:false) — a model whose
+  // endpoint rejects prompt_cache_key. whip then never sends -cache-key, so no
+  // 400 and no self-heal retry. Those models cache the prefix by match anyway.
+  const cacheKey =
+    req.promptCache !== false
+      ? `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}`
+      : undefined;
 
   // Noise profile: hard-filter by severity (the prompt asks too, this enforces).
   const keep = new Set(severitiesForProfile(profile));
@@ -495,8 +520,13 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
         error: err instanceof Error ? err.message : String(err),
         kind: err instanceof HarnessError ? err.kind : undefined,
       });
-      counts.mode = "fallback";
+      // Set the fallback mode only once the headless retry actually resolves.
+      // In an ensemble, this runs per leg against shared counts; a leg that
+      // dies on the fallback too must not leave "fallback" behind to taint the
+      // survivors' mode (otherwise a fully-agentic survivor review renders as
+      // "headless fallback (agentic run failed)" in Run details).
       parsed = await run(false, model ? `fallback:${model}` : "fallback");
+      counts.mode = "fallback";
     }
     counts.malformedFindings += parsed.malformedFindings;
     counts.malformedConcerns += parsed.malformedConcerns;
@@ -651,6 +681,34 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     return result;
   }
 
+  // The review ran for minutes; the PR can merge, close, or receive a new push
+  // in that window. Re-read it right before publishing and stay silent if it is
+  // no longer safe to post onto — findings anchored to a dead diff read as the
+  // author ignoring a tool they never had a chance to act on (issue #39). The
+  // findings stay on the result for the trace; only the GitHub writes are
+  // suppressed. The check itself failing open: a lookup error proceeds to post,
+  // since a stale-but-correct finding is better than a silent dropped review.
+  const publishable = await checkPublishable(
+    octokit,
+    req.ref,
+    pull.headSha,
+  ).catch((err: unknown) => {
+    logger.warn("Publishability check failed; posting anyway", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { publishable: true } as const;
+  });
+  if (!publishable.publishable) {
+    logger.warn("Skipping publish — PR no longer safe to post onto", {
+      reviewer: req.reviewerName ?? "default",
+      reason: publishable.reason,
+      inline: inline.length,
+      dropped: dropped.length,
+      verdict,
+    });
+    return { ...result, skipped: { reason: publishable.reason } };
+  }
+
   const summaryBody = await postReview(
     octokit,
     req.ref,
@@ -702,7 +760,10 @@ async function verifyInline(
       whipConfig: req.whipConfig,
       maxTurns: req.maxTurns,
       reasoning: req.reasoning,
-      cacheKey: `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}/verify`,
+      cacheKey:
+        req.promptCache !== false
+          ? `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}/verify`
+          : undefined,
       trace: req.trace,
       phase: req.model ? `verify:${req.model}` : "verify",
       logger: req.logger,
