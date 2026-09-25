@@ -75,6 +75,10 @@ inputs:
     description: "Cap on the agentic tool loop. Overrides .loupe.json; default 10."
     required: false
     default: ""
+  max-comments:
+    description: "Max inline comments per review; extras are ranked by severity into a collapsed summary section. Overrides .loupe.json; default 10."
+    required: false
+    default: ""
   prompt-cache:
     description: "Send a prompt-cache key for prefix caching (true/false). Set false for models whose endpoint rejects prompt_cache_key. Overrides .loupe.json; default true (empty = use .loupe.json or true)."
     required: false
@@ -121,6 +125,7 @@ runs:
         LOUPE_SKILLS: ${{ inputs.skills }}
         LOUPE_TIMEZONE: ${{ inputs.timezone }}
         LOUPE_MAX_TURNS: ${{ inputs.max-turns }}
+        LOUPE_MAX_COMMENTS: ${{ inputs.max-comments }}
         LOUPE_PRIOR_COMMENTS: ${{ inputs.prior-comments }}
         LOUPE_CROSS_REVIEWER_DEDUP: ${{ inputs.cross-reviewer-dedup }}
         LOUPE_PROMPT_CACHE: ${{ inputs.prompt-cache }}

@@ -13,9 +13,17 @@ import type {
   HarnessContext,
   HarnessTraceEvent,
 } from "@loupe/harness";
+import type { Finding } from "../src/types";
 import { describe, expect, it, vi } from "vitest";
 
-import { isDegraded, runReview, type ReviewRequest } from "../src/index";
+import {
+  isDegraded,
+  reviewResultFromProduced,
+  runReview,
+  type ProducedReview,
+  type ReviewDiagnostics,
+  type ReviewRequest,
+} from "../src/index";
 
 const ref = { owner: "acme", repo: "app", pull_number: 7 };
 const SHA_A = "a".repeat(40);
@@ -357,6 +365,356 @@ const verifyAll = (n: number) =>
     verdicts: Array.from({ length: n }, (_, i) => ({ index: i, real: true })),
   });
 
+/** A minimal non-empty ProducedReview for unit-testing result assembly. */
+const producedWith = (
+  inline: readonly Finding[],
+  commentCap = 10,
+  concerns: readonly Finding[] = [],
+): ProducedReview => ({
+  reviewerName: "code",
+  review: {
+    summary: "s",
+    findings: [],
+    concerns: concerns as never,
+    highlights: [],
+  },
+  inline,
+  uncertain: [],
+  // The produce phase emits no overflow; the cap applies at result/publish
+  // time over the (possibly deduped) inline set.
+  overflow: [],
+  commentCap,
+  dropped: [],
+  diagnostics: {} as ReviewDiagnostics,
+  headSha: "d".repeat(40),
+  refreshPaths: new Set<string>(),
+  headPaths: new Set<string>(),
+  fileCount: 1,
+});
+
+describe("reviewResultFromProduced: cap × dedup verdict", () => {
+  const blocker: Finding = {
+    path: "a.ts",
+    line: 1,
+    severity: "blocker",
+    body: "b",
+  };
+  const warning: Finding = {
+    path: "a.ts",
+    line: 2,
+    severity: "warning",
+    body: "w",
+  };
+
+  it("a blocker demoted by the cap still requests changes", () => {
+    // Two blockers at a cap of one: one posts inline, one overflows, and the
+    // verdict must reflect the whole run, not just what posted.
+    const produced = producedWith([blocker, { ...blocker, line: 3 }], 1);
+    const r = reviewResultFromProduced(produced);
+    expect(r.inlineCount).toBe(1);
+    expect(r.overflow).toHaveLength(1);
+    expect(r.requestedChanges).toBe(true);
+    expect(r.diagnostics.cappedDropped).toBe(1);
+  });
+
+  it("a blocker removed by the dedup override no longer requests changes", () => {
+    // Upstream's contract: the verdict is recomputed from the deduped inline
+    // set, so a blocker that was a duplicate doesn't request changes.
+    const produced = producedWith([blocker, warning]);
+    const original = reviewResultFromProduced(produced);
+    expect(original.requestedChanges).toBe(true);
+    const deduped = reviewResultFromProduced(produced, []);
+    expect(deduped.requestedChanges).toBe(false);
+  });
+
+  it("the cap never resurrects a blocker that dedup removed", () => {
+    // Dedup leaves only a warning; capping that set cannot put the removed
+    // blocker back — inline or overflow — so the verdict stays off.
+    const produced = producedWith([blocker, warning], 1);
+    const deduped = reviewResultFromProduced(produced, [warning]);
+    expect(deduped.requestedChanges).toBe(false);
+    expect(deduped.overflow).toHaveLength(0);
+  });
+
+  it("no requirements when neither inline nor overflow holds a blocker", () => {
+    const produced = producedWith([warning, { ...warning, line: 3 }], 1);
+    const r = reviewResultFromProduced(produced);
+    expect(r.inlineCount).toBe(1);
+    expect(r.overflow).toHaveLength(1);
+    expect(r.requestedChanges).toBe(false);
+  });
+});
+
+describe("comment cap", () => {
+  // 12 findings: emit nits first, blockers last, to prove ranking, not
+  // emission order, decides what stays inline.
+  const manyFindings = [
+    ...Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "nit",
+      body: `nit ${i}`,
+    })),
+    ...Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "blocker",
+      body: `blocker ${i}`,
+    })),
+  ];
+
+  it("ranks by severity and spills extras into a collapsed summary section", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: reviewJson(manyFindings),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+        profile: "assertive",
+      }),
+    );
+
+    // All five inline comments are blockers, despite the nits being emitted first.
+    expect(result.inlineCount).toBe(5);
+    expect(result.inline.every((f) => f.severity === "blocker")).toBe(true);
+    expect(result.diagnostics.cappedDropped).toBe(7);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).toContain(
+      "Additional findings (ranked below the 5-comment cap)",
+    );
+    expect(body).toContain("`svc/a.ts:2` [nit] nit 0");
+  });
+
+  it("a blocker demoted by the cap still requests changes", async () => {
+    const api = fakeOctokit({});
+    const sixBlockers = Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "blocker",
+      body: `blocker ${i}`,
+    }));
+    const { harness } = fakeHarness({ agentic: reviewJson(sixBlockers) });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+      }),
+    );
+
+    expect(result.inlineCount).toBe(5);
+    expect(result.requestedChanges).toBe(true);
+    // The posted review event must carry the verdict even though every
+    // blocker's copy beyond the cap was demoted to the summary.
+    const reviewCall = (
+      api.pulls.createReview as unknown as {
+        mock: { calls: { event: string }[][] };
+      }
+    ).mock.calls[0]![0]!;
+    expect(reviewCall.event).toBe("REQUEST_CHANGES");
+  });
+
+  it("defaults to 10 when maxComments is omitted", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({ agentic: reviewJson(manyFindings) });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        verify: false,
+        profile: "assertive",
+      }),
+    );
+
+    expect(result.inlineCount).toBe(10);
+    expect(result.diagnostics.cappedDropped).toBe(2);
+  });
+
+  it("does nothing when findings are under the cap", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: reviewJson([
+        {
+          path: "svc/a.ts",
+          line: 2,
+          severity: "warning",
+          body: "w1",
+        },
+      ]),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+      }),
+    );
+
+    expect(result.inlineCount).toBe(1);
+    expect(result.diagnostics.cappedDropped).toBe(0);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).not.toContain("Additional findings");
+  });
+
+  it("exactly at the cap: everything posts inline, no overflow section", async () => {
+    const api = fakeOctokit({});
+    const five = Array.from({ length: 5 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "warning",
+      body: `w${i}`,
+    }));
+    const { harness } = fakeHarness({ agentic: reviewJson(five) });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+      }),
+    );
+
+    // Boundary must be inclusive: five findings at a cap of five post as-is.
+    expect(result.inlineCount).toBe(5);
+    expect(result.diagnostics.cappedDropped).toBe(0);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).not.toContain("Additional findings");
+  });
+
+  it("caps after the verification pass: findings rejected by verify never reach the cap", async () => {
+    const api = fakeOctokit({});
+    const six = Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "warning",
+      body: `w${i}`,
+    }));
+    const { harness } = fakeHarness({
+      agentic: reviewJson(six),
+      // Verify keeps only findings #0 and #2; the other four are rejected.
+      verify: JSON.stringify({
+        verdicts: six.map((_, i) => ({ index: i, real: i === 0 || i === 2 })),
+      }),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+      }),
+    );
+
+    // If the cap ran before verify, six findings would first be demoted to
+    // five and one would spill; running after verify, two survive and the
+    // cap never engages.
+    expect(result.diagnostics.verify).toBe("passed");
+    expect(result.diagnostics.verifyDropped).toBe(4);
+    expect(result.inlineCount).toBe(2);
+    expect(result.diagnostics.cappedDropped).toBe(0);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).not.toContain("Additional findings");
+  });
+
+  it("caps ensemble-merged findings: severity ranks a blocker over a demoted nit", async () => {
+    const api = fakeOctokit({});
+    // Both models emit the same two findings (one per diff anchor), so the
+    // majority merge confirms both. The nit is emitted first to prove the
+    // cap ranks by severity on the *merged* result, not emission order.
+    const merged = [
+      { path: "svc/a.ts", line: 2, severity: "nit", body: "nit" },
+      { path: "svc/b.ts", line: 11, severity: "blocker", body: "blocker" },
+    ];
+    const script = reviewJson(merged);
+    const { harness } = fakePerModelHarness({
+      "model-a": script,
+      "model-b": script,
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+        maxComments: 1,
+        profile: "assertive",
+      }),
+    );
+
+    // Ensemble merge confirmed exactly the two findings the models agreed on.
+    expect(result.inlineCount).toBe(1);
+    expect(result.inline[0]!.severity).toBe("blocker");
+    expect(result.diagnostics.cappedDropped).toBe(1);
+    expect(result.requestedChanges).toBe(true);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).toContain(
+      "Additional findings (ranked below the 1-comment cap)",
+    );
+    expect(body).toContain("`svc/a.ts:2` [nit] nit");
+  });
+
+  it("tallies demoted findings in the summary header, not only the inline review", async () => {
+    const api = fakeOctokit({});
+    const findings = [
+      ...Array.from({ length: 6 }, (_, i) => ({
+        path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+        line: i % 2 === 0 ? 2 : 11,
+        severity: "nit",
+        body: `nit ${i}`,
+      })),
+    ];
+    const { harness } = fakeHarness({ agentic: reviewJson(findings) });
+    await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 2,
+        verify: false,
+        profile: "assertive",
+      }),
+    );
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as { body: string }
+    ).body;
+    // The stat line must count all six findings, not just the two that
+    // posted inline (Bugbot: capped findings were omitted from tallies).
+    expect(body).toContain("🔵 6");
+  });
+
+  it("deferSummary: the overflow section lands in the returned summaryBody for the orchestrator", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: reviewJson(manyFindings),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 4,
+        verify: false,
+        profile: "assertive",
+        deferSummary: true,
+      }),
+    );
+
+    expect(result.inlineCount).toBe(4);
+    expect(result.diagnostics.cappedDropped).toBe(8);
+    // The orchestrator (not runReview) posts the combined summary, so the
+    // overflow note must travel on summaryBody.
+    expect(result.summaryBody).toContain(
+      "Additional findings (ranked below the 4-comment cap)",
+    );
+    // Nothing was posted as an issue comment; only the inline review exists.
+    expect(api.issues.createComment).not.toHaveBeenCalled();
+  });
+});
+
 describe("runReview end to end", () => {
   it("incremental run: whole in-scope diff on disk, only B reassessed, A findings dropped, cleanup scoped to B after posting", async () => {
     const api = fakeOctokit({
@@ -421,6 +779,7 @@ describe("runReview end to end", () => {
       verifyDropped: 0,
       crossReviewerDropped: 0,
       offDiff: 0,
+      cappedDropped: 0,
       salvagedFindings: 0,
       degradedLegs: [],
     });
@@ -653,6 +1012,136 @@ describe("runReview end to end", () => {
       "Lower-confidence findings (raised by a minority of models)",
     );
     expect(result.summaryBody).toContain("svc/a.ts:2");
+  });
+
+  it("unions concerns, highlights, and off-diff notes across surviving ensemble legs (issue #40)", async () => {
+    // Two models both survive. Model A raises an off-diff finding (unusable line)
+    // and a highlight; model B raises the same off-diff finding reworded, plus a
+    // concern and a highlight A didn't have. Before #40's fix, only the first
+    // survivor's review body was kept — B's concern and the union of dropped
+    // notes were silently discarded.
+    const api = fakeOctokit({});
+    const fullReview = JSON.stringify({
+      summary: "reviewed",
+      findings: [
+        // In-scope file, unusable line (far past the 3-line hunk) → salvages
+        // into the off-diff notes.
+        {
+          path: "svc/a.ts",
+          line: 999,
+          severity: "warning",
+          body: "config value is read before initialization",
+        },
+      ],
+      concerns: [],
+      highlights: ["cleanup of the retry loop"],
+    });
+    const { harness } = fakePerModelHarness({
+      "model-a": fullReview,
+      "model-b": JSON.stringify({
+        summary: "reviewed",
+        findings: [
+          // Same off-diff claim reworded by B — unions to one note.
+          {
+            path: "svc/a.ts",
+            line: 999,
+            severity: "warning",
+            body: "config value is read before it is initialized here",
+          },
+        ],
+        concerns: [
+          {
+            title: "Retry budget is shared across request paths",
+            detail:
+              "The retry budget counter is global, so one hot path can starve the others.",
+            severity: "warning",
+          },
+        ],
+        highlights: [
+          "cleanup of the retry loop",
+          "nice test coverage on parse",
+        ],
+      }),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+      }),
+    );
+
+    // The off-diff notes union: both legs' notes survive the union, and the
+    // reworded duplicate collapses to one entry (was: only the first
+    // survivor's single note).
+    expect(result.diagnostics.offDiff).toBe(1);
+    // B's concern survives into the posted review even though A came first.
+    expect(result.summaryBody).toContain("Retry budget is shared");
+    // Highlights union: A's plus B's unique one, deduped overlap.
+    expect(result.summaryBody).toContain("nice test coverage on parse");
+  });
+
+  it("concern merge never downgrades severity, and loose title matches don't merge (Bugbot)", async () => {
+    // Bugbot 1: a later leg's lower-severity concern with a longer writeup
+    // used to replace the first raiser's blocker. Bugbot 2: titles sharing a
+    // prefix used to merge at the 0.1 body threshold, dropping a leg's unique
+    // concern.
+    const api = fakeOctokit({});
+    const { harness } = fakePerModelHarness({
+      "model-a": JSON.stringify({
+        summary: "reviewed",
+        findings: [],
+        concerns: [
+          {
+            title: "Database migration has no rollback path",
+            detail:
+              "The migration adds a column with a default but never documents how to roll it back if deployment aborts halfway.",
+            severity: "blocker",
+          },
+        ],
+        highlights: [],
+      }),
+      "model-b": JSON.stringify({
+        summary: "reviewed",
+        findings: [],
+        concerns: [
+          // Longer detail, lower severity: must NOT replace the blocker.
+          {
+            title: "Database migration lacks a documented rollback procedure",
+            detail:
+              "There is no written procedure describing what an operator should do to roll this migration back if the deployment fails partway through, " +
+              "which would leave the schema in a mixed state with the new column present and the backfill incomplete. " +
+              "Operators would need to reconstruct recovery steps from the migration source by hand under pressure during an incident.",
+            severity: "nit",
+          },
+          // Shares headword, describes a distinct issue: must stay separate.
+          {
+            title: "Database pool sizing is hardcoded",
+            detail:
+              "The connection pool is sized for local development; production traffic would exhaust it before the migration even runs.",
+            severity: "warning",
+          },
+        ],
+        highlights: [],
+      }),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+      }),
+    );
+
+    // The blocker was reworded by model-b and merged in (same claim, its nit
+    // copy is the longer detail): the posted representative must still be a
+    // blocker — never the reworded nit.
+    const body = result.summaryBody ?? "";
+    const lines = body
+      .split("\n")
+      .filter((l) => l.includes("rollback") || l.includes("hardcoded"));
+    expect(lines.length).toBeGreaterThanOrEqual(2); // both concerns posted
+    const rollbackLine = lines.find((l) => l.includes("rollback"));
+    expect(rollbackLine).toContain("🔴"); // blocker marker preserved
+    expect(body).toContain("Database pool sizing is hardcoded");
   });
 
   it("a leg that dies on the headless fallback does not taint the survivors' mode", async () => {

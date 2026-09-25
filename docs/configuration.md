@@ -45,6 +45,7 @@ whose globs match a changed file and posts each as its own labeled review
 | `procedure` | no | `false` drops the always-on review procedure (caller check, wrapper rule) from this reviewer's prompt. Also a top-level default. |
 | `promptCache` | no | `false` (default `true`) suppresses the stable prompt-cache key loupe sends so the provider reuses the cached system prefix. Set `false` for a reviewer whose model rejects `prompt_cache_key` as an unrecognized argument (e.g. some OpenAI-compatible endpoints strict-validate unknown fields); those models cache the prefix automatically by match, so the key adds nothing and its presence can 400. Also a top-level default and the `prompt-cache` Action input / `--no-prompt-cache` flag. The whip harness also self-heals a cache-key 400 by retrying without the key, so this flag only skips that wasted round-trip. |
 | `priorComments` | no | What happens to this reviewer's earlier inline comments on a re-review: `resolve` (default: resolve the thread, history kept) \| `delete` \| `keep` (leave them, new comments accumulate). Also a top-level default and the `prior-comments` Action input / `--prior-comments` flag. |
+| `maxComments` | no | Max inline comments posted (default 10). Extras are ranked out by severity and listed in a collapsed "Additional findings" section of the summary; a demoted blocker still requests changes. Also a top-level default and the `max-comments` Action input / `--max-comments` flag. |
 | `crossReviewerDedup` | no | `false` lets the same finding post from multiple reviewers (no dedup). Default `true`: before posting, the union of all reviewers' inline findings is deduplicated so the same reworded claim posts once. Also a top-level default and the `cross-reviewer-dedup` Action input. |
 
 Globs are matched against repo-relative paths. `include` composes with `dir`.
@@ -146,6 +147,12 @@ Two scopes:
 - **Noise profile** — `quiet` posts only blockers, `chill` (default) blockers +
   warnings, `assertive` everything. Both prompt-level and a hard severity
   filter.
+- **Comment cap** — at most `maxComments` (default 10) inline comments per
+  review. When there are more findings, they are ranked by severity
+  (`blocker` > `warning` > `nit`), the top ones go inline, and the rest are
+  listed in a collapsed "Additional findings" section of the summary — nothing
+  is lost, it just stops dominating the diff. A demoted blocker still yields
+  a REQUEST_CHANGES verdict.
 - **Path instructions** — per-glob natural-language guidance injected only when
   a matching file changed (e.g. "in `**/*.sql`, flag full-table locks").
 - **Incremental review** — on a re-review, loupe reassesses only the in-scope

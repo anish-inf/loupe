@@ -35,6 +35,7 @@ const mockProduce = vi.fn(async (input: RunInput): Promise<ProducedReview> => {
     profileDropped: 0,
     verifyDropped: 0,
     crossReviewerDropped: 0,
+    cappedDropped: 0,
     offDiff: 0,
     salvagedFindings: 0,
     degradedLegs: [],
@@ -49,6 +50,7 @@ const mockProduce = vi.fn(async (input: RunInput): Promise<ProducedReview> => {
     },
     inline,
     uncertain: [],
+    overflow: [],
     dropped: [],
     diagnostics: clean,
     headSha: "b".repeat(40),
@@ -254,6 +256,7 @@ const diagnostics = {
   offDiff: 0,
   salvagedFindings: 0,
   crossReviewerDropped: 0,
+  cappedDropped: 0,
   degradedLegs: [],
 };
 type OkOutcome = { name: string; ok: true; result: ReviewResult };
@@ -266,6 +269,7 @@ const clean = (name: string): OkOutcome => ({
     requestedChanges: false,
     summary: "Looks fine.",
     inline: [],
+    overflow: [],
     dropped: [],
     diagnostics,
   },

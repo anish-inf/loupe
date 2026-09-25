@@ -79,6 +79,7 @@ const diagnostics = {
   offDiff: 0,
   salvagedFindings: 0,
   crossReviewerDropped: 0,
+  cappedDropped: 0,
   degradedLegs: [] as string[],
 };
 const produced = {
@@ -91,6 +92,7 @@ const produced = {
   },
   inline: [],
   uncertain: [],
+  overflow: [],
   dropped: [],
   diagnostics,
   headSha: "h".repeat(40),
@@ -104,6 +106,7 @@ const result: ReviewResult = {
   requestedChanges: false,
   summary: "Looks fine.",
   inline: [],
+  overflow: [],
   dropped: [],
   diagnostics,
 };

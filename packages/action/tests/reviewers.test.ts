@@ -66,3 +66,36 @@ describe("dir setting", () => {
     expect(loadReviewers(q)[0]!.promptCache).toBe(false);
   });
 });
+
+describe("maxComments", () => {
+  it("loads as a top-level default and per reviewer, reviewer overriding the file", () => {
+    const p = config({
+      maxComments: 20,
+      reviewers: [
+        { name: "code", prompt: "x", maxComments: 5 },
+        { name: "engine", prompt: "y" },
+      ],
+    });
+    // Top-level default surfaces for the Action input / CLI flag chain.
+    expect(loadSettings(p).maxComments).toBe(20);
+    const [code, engine] = loadReviewers(p);
+    expect(code!.maxComments).toBe(5);
+    // A reviewer without its own value inherits the top-level default at
+    // call time (r.maxComments ?? maxComments), staying undefined here.
+    expect(engine!.maxComments).toBeUndefined();
+  });
+
+  it("rejects non-positive and fractional values at both levels", () => {
+    for (const bad of [0, -3, 2.5]) {
+      const top = config({
+        maxComments: bad,
+        reviewers: [{ name: "code", prompt: "x" }],
+      });
+      expect(() => loadSettings(top)).toThrow();
+      const perReviewer = config({
+        reviewers: [{ name: "code", prompt: "x", maxComments: bad }],
+      });
+      expect(() => loadReviewers(perReviewer)).toThrow();
+    }
+  });
+});

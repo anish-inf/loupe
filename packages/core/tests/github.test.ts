@@ -609,6 +609,7 @@ describe("summary rendering", () => {
           profileDropped: 0,
           verifyDropped: 0,
           crossReviewerDropped: 0,
+          cappedDropped: 0,
           offDiff: 1,
           salvagedFindings: 0,
           degradedLegs: [],
@@ -646,6 +647,7 @@ describe("summary rendering", () => {
           profileDropped: 0,
           verifyDropped: 0,
           crossReviewerDropped: 0,
+          cappedDropped: 0,
           offDiff: 1,
           salvagedFindings: 1,
           degradedLegs: [],
@@ -1094,5 +1096,192 @@ describe("checkPrOpen", () => {
     await expect(checkPrOpen(api as never, ref)).resolves.toEqual({
       open: true,
     });
+  });
+});
+
+describe("open Loupe findings", () => {
+  it("collects unresolved findings from configured reviewers across incremental heads", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      threadPages: [
+        [
+          {
+            id: "current",
+            path: "src/a.ts",
+            line: 12,
+            root: {
+              body: `🟡 **warning** fix this\n\n<!-- loupe:code sha=${sha} -->`,
+              login: "loupe-bot",
+            },
+          },
+          {
+            id: "resolved",
+            path: "src/b.ts",
+            isResolved: true,
+            root: {
+              body: `old\n\n<!-- loupe:code sha=${sha} -->`,
+              login: "loupe-bot",
+            },
+          },
+          {
+            id: "human",
+            path: "src/c.ts",
+            root: {
+              body: `quoted <!-- loupe:code sha=${sha} -->`,
+              login: "human",
+            },
+          },
+          {
+            id: "stale",
+            path: "src/d.ts",
+            root: {
+              body: `stale\n\n<!-- loupe:code sha=${"b".repeat(40)} -->`,
+              login: "loupe-bot",
+            },
+          },
+        ],
+      ],
+    });
+
+    await expect(
+      listOpenLoupeFindings(api as never, ref, sha, new Set(["code"])),
+    ).resolves.toEqual([
+      {
+        reviewer: "code",
+        path: "src/a.ts",
+        line: 12,
+        body: "🟡 **warning** fix this",
+        sha,
+        url: "https://example.test/thread",
+      },
+      {
+        reviewer: "code",
+        path: "src/d.ts",
+        body: "stale",
+        sha: "b".repeat(40),
+        url: "https://example.test/thread",
+      },
+    ]);
+  });
+});
+
+describe("combined summary", () => {
+  it("preserves a skipped reviewer's previous section", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      issueComments: [
+        {
+          id: 2,
+          body: `# Loupe\n\n---\n\n## code\n\nPrevious findings\n\n---\n\nStill part of code review\n\n<!-- loupe:summary:code sha=${sha} -->\n\n---\n\nUse fix\n\n<!-- loupe:summary:combined -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(
+      api as never,
+      ref,
+      "# Loupe\n\n---\n\n## code\n\n_Not run: No in-scope changes since the last review._\n\n---\n\nUse fix",
+    );
+    const update = api.issues.updateComment.mock.calls[0] as unknown as [
+      { body: string },
+    ];
+    const body = update[0].body;
+    expect(body).toContain("Previous findings");
+    expect(body).toContain("Still part of code review");
+    expect(body).toContain("Not updated in this run");
+    expect(body).toContain(`<!-- loupe:summary:code sha=${sha} -->`);
+    expect(body).not.toContain("_Not run:");
+  });
+
+  it("restores a marked skipped section inside exactly one boundary pair", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      issueComments: [
+        {
+          id: 2,
+          body: `# Loupe\n\n---\n\n<!-- loupe:section:code:start -->\n## code\n\nPrevious findings\n\n<!-- loupe:summary:code sha=${sha} -->\n<!-- loupe:section:code:end -->\n\n---\n\n<!-- loupe:section:security:start -->\n## security\n\nSecurity details\n\n<!-- loupe:summary:security sha=${sha} -->\n<!-- loupe:section:security:end -->\n\n---\n\nUse \`@loupe fix\`\n\n<!-- loupe:summary:combined -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(
+      api as never,
+      ref,
+      `# Loupe\n\n---\n\n<!-- loupe:section:code:start -->\n## code\n\n_Not run: No changes._\n<!-- loupe:section:code:end -->\n\n---\n\n<!-- loupe:section:security:start -->\n## security\n\nNew security result\n\n<!-- loupe:summary:security sha=${sha} -->\n<!-- loupe:section:security:end -->\n\n---\n\nUse \`@loupe fix\``,
+    );
+    const update = api.issues.updateComment.mock.calls[0] as unknown as [
+      { body: string },
+    ];
+    const updated = update[0].body;
+    expect(updated).toContain("Previous findings");
+    expect(updated).toContain("New security result");
+    expect(updated).not.toContain("Security details");
+    expect(updated.match(/loupe:section:code:start/g)).toHaveLength(1);
+    expect(updated.match(/loupe:section:code:end/g)).toHaveLength(1);
+    expect(updated).not.toContain("_Not run: No changes._");
+  });
+
+  it("does not let a retained marker swallow later reviewer sections", async () => {
+    const sha = "a".repeat(40);
+    api = octokit({
+      issueComments: [
+        {
+          id: 2,
+          body: `# Loupe\n\n---\n\n## code\n\nNo marker in this section\n\n---\n\n## security\n\nSecurity details\n\n<!-- loupe:summary:security sha=${sha} -->\n\n---\n\nUse \`@loupe fix\`\n\n<!-- loupe:summary:code sha=${sha} -->\n\n<!-- loupe:summary:combined -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(
+      api as never,
+      ref,
+      "# Loupe\n\n---\n\n## code\n\n_Not run: No changes._\n\n---\n\nUse `@loupe fix`",
+    );
+    const update = api.issues.updateComment.mock.calls[0] as unknown as [
+      { body: string },
+    ];
+    expect(update[0].body).toContain("_Not run: No changes._");
+    expect(update[0].body).not.toContain("Security details");
+  });
+
+  it("marks legacy summaries stale without deleting them", async () => {
+    api = octokit({
+      issueComments: [
+        {
+          id: 3,
+          body: `legacy\n\n<!-- loupe:summary:code sha=${"a".repeat(40)} -->`,
+          user: bot,
+        },
+      ],
+    });
+    await upsertCombinedSummary(api as never, ref, "# New summary");
+    expect(api.issues.deleteComment).not.toHaveBeenCalled();
+    expect(api.issues.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        comment_id: 3,
+        body: expect.stringContaining("<!-- loupe:summary:stale -->"),
+      }),
+    );
+  });
+
+  it("updates only the bot-authored combined summary", async () => {
+    api = octokit({
+      issueComments: [
+        {
+          id: 1,
+          body: "quoted <!-- loupe:summary:combined -->",
+          user: { login: "human" },
+        },
+        { id: 2, body: "old <!-- loupe:summary:combined -->", user: bot },
+      ],
+    });
+    await upsertCombinedSummary(api as never, ref, "# New summary");
+    expect(api.issues.updateComment).toHaveBeenCalledWith(
+      expect.objectContaining({
+        comment_id: 2,
+        body: expect.stringContaining("# New summary"),
+      }),
+    );
+    expect(api.issues.createComment).not.toHaveBeenCalled();
   });
 });

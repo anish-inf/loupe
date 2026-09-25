@@ -53,6 +53,7 @@ export type RunInput = {
   readonly timezone?: string;
   readonly whipConfig?: WhipConfig;
   readonly maxTurns?: number;
+  readonly maxComments?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
   readonly promptCache?: boolean;
@@ -123,6 +124,7 @@ async function buildRequest(input: RunInput): Promise<ReviewRequest> {
     skills: input.skills,
     timezone: input.timezone,
     maxTurns: input.maxTurns,
+    maxComments: input.maxComments,
     priorComments: input.priorComments,
     procedure: input.procedure,
     promptCache: input.promptCache,
@@ -193,6 +195,9 @@ export function formatResult(result: ReviewResult): string {
   const d = result.diagnostics;
   return (
     `loupe: ${result.inlineCount} inline comment(s)` +
+    (result.diagnostics.cappedDropped > 0
+      ? `, ${result.diagnostics.cappedDropped} capped (in summary)`
+      : "") +
     (result.droppedCount > 0
       ? `, ${result.droppedCount} off-diff note(s)`
       : "") +
@@ -216,8 +221,19 @@ export function renderReview(result: ReviewResult): string {
     `\nSummary: ${result.summary}\n`,
     `Run: mode=${d.mode} verify=${d.verify} scope=${d.incremental} malformed=${d.malformedDropped.findings}/${d.malformedDropped.concerns} outOfScope=${d.outOfScopeDropped} profile=${d.profileDropped} verifyDropped=${d.verifyDropped} crossReviewerDropped=${d.crossReviewerDropped}\n`,
   ];
+  if (d.cappedDropped > 0) {
+    lines.push(
+      `Capped by the comment cap (see summary): ${d.cappedDropped} finding(s) ranked below the cut`,
+    );
+  }
   for (const f of [...result.inline, ...result.dropped]) {
     lines.push(`${SEVERITY_MARK[f.severity] ?? "•"} ${anchorLabel(f)}`);
+    lines.push(`   ${f.body}\n`);
+  }
+  for (const f of result.overflow) {
+    lines.push(
+      `${SEVERITY_MARK[f.severity] ?? "•"} ${anchorLabel(f)} [capped]`,
+    );
     lines.push(`   ${f.body}\n`);
   }
   return lines.join("\n");
