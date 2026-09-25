@@ -3,7 +3,12 @@ import { Octokit } from "@octokit/rest";
 import type { Logger } from "@loupe/logger";
 
 import type { DiffFile } from "./diff";
-import type { Finding, ReviewOutput } from "./types";
+import {
+  anchorLabel,
+  type Finding,
+  type Note,
+  type ReviewOutput,
+} from "./types";
 
 export type PullRef = {
   readonly owner: string;
@@ -17,6 +22,8 @@ export type PullContext = {
   readonly files: readonly DiffFile[];
   /** The PR head commit SHA (what this review is of). */
   readonly headSha: string;
+  /** Every file path that exists at `head` (the full PR file list). */
+  readonly headPaths: ReadonlySet<string>;
 };
 
 /**
@@ -51,7 +58,67 @@ export async function fetchPullContext(
     description: pr.body ?? "",
     files: files.map((f) => ({ path: f.filename, patch: f.patch })),
     headSha: pr.head.sha,
+    headPaths: new Set(files.map((f) => f.filename)),
   };
+}
+
+/**
+ * Why a pre-publish review was skipped. The PR can change state between the
+ * start of a run and the moment loupe is ready to post; re-reading it right
+ * before publishing catches a merge, close, or head move that happened while
+ * inference was running. See issue #39.
+ */
+export type SkipReason = "merged" | "closed" | "head-moved";
+
+/** A pre-publish freshness check result: either publishable, or why not. */
+export type PublishCheck =
+  | { readonly publishable: true }
+  | { readonly publishable: false; readonly reason: SkipReason };
+
+/**
+ * Re-read the pull request right before publishing and decide whether it is
+ * still safe to post findings onto it. The review runs for minutes and the PR
+ * can merge, close, or receive a new push in that window; posting onto a dead
+ * diff reads as the author ignoring the tool when they never had a chance.
+ *
+ * `reviewedHeadSha` is the head SHA the review was computed against (captured
+ * at the start of the run). A different current head means the findings are
+ * anchored to a commit the branch has moved past, so they are not published.
+ */
+export async function checkPublishable(
+  octokit: Octokit,
+  ref: PullRef,
+  reviewedHeadSha: string,
+): Promise<PublishCheck> {
+  const { data: pr } = await octokit.pulls.get(ref);
+  if (pr.merged) return { publishable: false, reason: "merged" };
+  if (pr.state === "closed") return { publishable: false, reason: "closed" };
+  if (pr.head.sha !== reviewedHeadSha) {
+    return { publishable: false, reason: "head-moved" };
+  }
+  return { publishable: true };
+}
+
+/**
+ * Re-read the pull request and report whether it is still open (not merged, not
+ * closed). Used to gate writes that carry findings but are not anchored to a
+ * specific head — the combined summary — where a head move is already handled
+ * per reviewer (`checkPublishable`) and the only fatal state is the PR being
+ * gone. Comparing heads here would need a run-start anchor that can race the
+ * reviewers' own fetches and falsely skip a summary whose inline comments are
+ * valid on the current head, so this check deliberately ignores the head.
+ */
+export async function checkPrOpen(
+  octokit: Octokit,
+  ref: PullRef,
+): Promise<
+  | { readonly open: true }
+  | { readonly open: false; readonly reason: "merged" | "closed" }
+> {
+  const { data: pr } = await octokit.pulls.get(ref);
+  if (pr.merged) return { open: false, reason: "merged" };
+  if (pr.state === "closed") return { open: false, reason: "closed" };
+  return { open: true };
 }
 
 /** Login the workflow token posts as when `GET /user` is unavailable to it. */
@@ -162,6 +229,10 @@ const COMPARE_FILE_CAP = 300;
  * Files changed between two commits (the incremental-review delta). Throws
  * when the response hits GitHub's file cap, because a silently truncated delta
  * would drop files from the review and then advance the reviewed SHA past them.
+ *
+ * Renamed files need no special handling here: threads stranded at a vanished
+ * old path are swept by `snapshotPriorComments` (via `headPaths`), which covers
+ * renames, delete+add rewrites, deletions, and full reviews alike.
  */
 export async function changedFilesBetween(
   octokit: Octokit,
@@ -402,13 +473,13 @@ mutation LoupeResolveThread($threadId: ID!) {
 }`;
 
 /**
- * Select this reviewer's prior inline comments so re-reviews replace rather
- * than duplicate. Only comments posted under loupe's own login with this
- * reviewer's marker qualify; a human quoting the marker is left alone. Scope:
- * `undefined` paths = every such comment, an empty set = none, otherwise only
- * comments on those paths. Runs BEFORE the new review posts so the snapshot
- * can never include the replacements. Best-effort: a failed lookup selects
- * nothing and warns.
+ * Take a point-in-time snapshot of this reviewer's prior comments eligible for
+ * cleanup, so re-reviews replace rather than duplicate. Only comments posted
+ * under loupe's own login with this reviewer's marker qualify; a human quoting
+ * the marker is left alone. `scope` selects which paths are eligible:
+ * `undefined` = every such comment, otherwise only those paths. Runs BEFORE
+ * the new review posts so the snapshot can never include the replacements.
+ * Best-effort: a failed lookup selects nothing and warns.
  */
 async function snapshotPriorComments(
   octokit: Octokit,
@@ -416,12 +487,10 @@ async function snapshotPriorComments(
   reviewerName: string | undefined,
   policy: PriorComments,
   logger: Logger,
-  refreshPaths?: ReadonlySet<string>,
+  scope?: (path: string) => boolean,
 ): Promise<PriorSnapshot> {
-  if (policy === "keep" || refreshPaths?.size === 0) return EMPTY_SNAPSHOT;
+  if (policy === "keep") return EMPTY_SNAPSHOT;
   const prefix = markerPrefix(reviewerName);
-  const inScope = (path: string): boolean =>
-    !refreshPaths || refreshPaths.has(path);
   try {
     const self = await getSelfLogin(octokit);
     if (policy === "delete") {
@@ -440,7 +509,7 @@ async function snapshotPriorComments(
             (c) =>
               c.user?.login === self &&
               c.body.includes(prefix) &&
-              inScope(c.path),
+              (!scope || (c.path !== undefined && scope(c.path))),
           )
           .map((c) => c.id),
         threadIds: [],
@@ -460,7 +529,7 @@ async function snapshotPriorComments(
       );
       const conn = page.repository.pullRequest.reviewThreads;
       for (const t of conn.nodes) {
-        if (!t || t.isResolved || !inScope(t.path)) continue;
+        if (!t || t.isResolved || (scope && !scope(t.path))) continue;
         const root = t.comments.nodes[0];
         if (!root || root.replyTo || root.author?.login !== self) continue;
         if (!root.body.includes(prefix)) continue;
@@ -554,10 +623,21 @@ export type ReviewDiagnostics = {
   readonly profileDropped: number;
   /** Inline findings the verification pass judged not real. */
   readonly verifyDropped: number;
+  /** Inline findings suppressed as duplicates of a finding another reviewer owns. */
+  readonly crossReviewerDropped: number;
   /** Off-diff notes actually published under "Other notes". */
   readonly offDiff: number;
   /** Inline findings demoted to the summary by the comment cap. */
   readonly cappedDropped: number;
+  /** Schema-rejected findings kept as notes instead of dropped. */
+  readonly salvagedFindings: number;
+  /**
+   * Ensemble models that failed and were dropped from the merge so the
+   * surviving legs' findings still post. Empty (and undefined semantically)
+   * for a non-ensemble or fully-successful run; names the failed model ids
+   * otherwise, so the summary can flag the review as degraded.
+   */
+  readonly degradedLegs: readonly string[];
 };
 
 /** True when the run lost or skipped something the reader should know about. */
@@ -567,7 +647,9 @@ export function isDegraded(d: ReviewDiagnostics): boolean {
     d.verify === "invalid" ||
     d.verify === "failed" ||
     d.incremental === "unknown" ||
-    d.malformedDropped.findings + d.malformedDropped.concerns > 0
+    d.malformedDropped.findings + d.malformedDropped.concerns > 0 ||
+    d.salvagedFindings > 0 ||
+    d.degradedLegs.length > 0
   );
 }
 
@@ -578,8 +660,21 @@ function renderDiagnostics(d: ReviewDiagnostics): string {
     }`,
     `- verification: ${d.verify}`,
     `- scope: ${d.incremental}${d.incremental === "unknown" ? " (history lookup failed; prior comments kept)" : ""}`,
-    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification, ${d.cappedDropped} demoted by the comment cap`,
-    `- off-diff notes published: ${d.offDiff}`,
+    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification, ${d.cappedDropped} demoted by the comment cap, ${d.crossReviewerDropped} duplicate of another reviewer`,
+    `- off-diff notes published: ${d.offDiff}${
+      d.salvagedFindings > 0
+        ? ` (${d.salvagedFindings} salvaged from malformed finding(s))`
+        : ""
+    }`,
+    // Only surface an ensemble row when a leg was actually lost. A clean
+    // ensemble has nothing to flag, and a non-ensemble run has no ensemble to
+    // report on — rendering "all models completed" for either would be noise
+    // (and a plain single-model review isn't an ensemble at all).
+    ...(d.degradedLegs.length > 0
+      ? [
+          `- ensemble: ⚠️ degraded — ${d.degradedLegs.length} model(s) failed and dropped: ${d.degradedLegs.join(", ")}`,
+        ]
+      : []),
   ];
   return `<details><summary>Run details</summary>\n\n${rows.join("\n")}\n\n</details>`;
 }
@@ -610,7 +705,7 @@ function renderReviewBody(
   stats: string,
   review: ReviewOutput,
   inline: readonly Finding[],
-  dropped: readonly Finding[],
+  dropped: readonly Note[],
   diagnostics: ReviewDiagnostics | undefined,
   tag: string,
 ): string {
@@ -647,7 +742,9 @@ function renderReviewBody(
       `<details><summary>Other notes (${dropped.length})</summary>\n\n${dropped
         .map(
           (f) =>
-            `${SEV_EMOJI[f.severity]} \`${f.path}:${f.line}\`\n\n${f.body.trim()}`,
+            `${SEV_EMOJI[f.severity]} \`${anchorLabel(f)}\`${
+              f.line === undefined ? " _unanchored_" : ""
+            }\n\n${f.body.trim()}`,
         )
         .join("\n\n")}\n\n</details>`,
     );
@@ -655,6 +752,50 @@ function renderReviewBody(
   if (diagnostics) parts.push(renderDiagnostics(diagnostics));
   parts.push(tag);
   return parts.join("\n\n");
+}
+
+/**
+ * The cleanup scope for prior-comment snapshotting: `undefined` = every marked
+ * comment of this reviewer, otherwise only those paths — plus, always, any path
+ * that no longer exists at head. A thread anchored at a vanished path (renamed
+ * or deleted since it was posted) can never be superseded by a scoped refresh,
+ * so it is swept regardless of scope rather than stranded forever. Threads on
+ * paths that still exist stay bound to the scope filter.
+ */
+function scopeFor(
+  refreshPaths: ReadonlySet<string> | undefined,
+  headPaths: ReadonlySet<string> | undefined,
+): ((path: string) => boolean) | undefined {
+  // An empty refresh set means "clean up nothing"; keep that strictness.
+  if (!refreshPaths) return undefined;
+  if (refreshPaths.size === 0) return () => false;
+  if (!headPaths) return (path) => refreshPaths.has(path);
+  return (path) => refreshPaths.has(path) || !headPaths.has(path);
+}
+
+/**
+ * Resolve or delete this reviewer's prior loupe comments anchored at paths that
+ * no longer exist at head — stranded by a rename or deletion, where no scoped
+ * refresh can ever reach them. Best-effort: failures leave threads in place.
+ */
+export async function cleanupStrandedThreads(
+  octokit: Octokit,
+  ref: PullRef,
+  headPaths: ReadonlySet<string>,
+  logger: Logger,
+  options?: { reviewerName?: string; priorComments?: PriorComments },
+): Promise<void> {
+  const policy = options?.priorComments ?? "resolve";
+  if (policy === "keep") return;
+  const snapshot = await snapshotPriorComments(
+    octokit,
+    ref,
+    options?.reviewerName,
+    policy,
+    logger,
+    (path) => !headPaths.has(path),
+  );
+  await cleanupPriorComments(octokit, ref, snapshot, logger);
 }
 
 /**
@@ -673,6 +814,12 @@ export type PostReviewOptions = {
    * reviewer, empty set = clean up nothing, otherwise only those paths.
    */
   readonly refreshPaths?: ReadonlySet<string>;
+  /**
+   * Paths that exist at head (the full PR file list). A prior thread anchored
+   * at any other path is stranded — its file was renamed or deleted — and is
+   * swept regardless of scope.
+   */
+  readonly headPaths?: ReadonlySet<string>;
   /** Files in scope, for the stat line. */
   readonly fileCount: number;
   /** What to do with prior inline comments (default resolve). */
@@ -725,6 +872,24 @@ function priorReviewerSection(
   return marker ? section : undefined;
 }
 
+/**
+ * True for a combined-summary section body that carries no findings and should
+ * be restored from the prior summary: either the `_Not run:` stub (a reviewer
+ * with nothing to reassess) or the `Skipped:` stub (a pre-publish freshness
+ * skip - findings were computed but not posted, so the section has no SHA
+ * marker and no content worth keeping). Both would otherwise wipe the
+ * reviewer's previous findings when the combined summary is upserted, since
+ * the summary gate only blocks merged/closed PRs and a head-moved PR is still
+ * open (issue #39).
+ */
+function isNoUpdateStub(content: string): boolean {
+  const trimmed = content.trim();
+  return (
+    /^## [^\n]+\n\n_Not run: [^\n]*_$/s.test(trimmed) ||
+    /^## [^\n]+\n\n\u23F8\uFE0F Skipped: /.test(trimmed)
+  );
+}
+
 function preserveSkippedSummarySections(
   body: string,
   priorBody?: string,
@@ -736,7 +901,7 @@ function preserveSkippedSummarySections(
   const marked = body.replace(
     /<!-- loupe:section:([^\s]+):start -->\n([\s\S]*?)\n<!-- loupe:section:\1:end -->/g,
     (section, reviewer: string, content: string) => {
-      if (!/^## [^\n]+\n\n_Not run: [^\n]*_$/s.test(content.trim())) {
+      if (!isNoUpdateStub(content)) {
         return section;
       }
       const priorSection = priorReviewerSection(priorBody, reviewer);
@@ -749,7 +914,7 @@ function preserveSkippedSummarySections(
   // Backward compatibility for callers/new bodies created before section
   // boundaries were introduced.
   return marked.replace(
-    /## ([^\n]+)\n\n_Not run: [^\n]*_(?=\n\n---|$)/g,
+    /## ([^\n]+)\n\n(_Not run: [^\n]*_|\u23F8\uFE0F Skipped: [^\n]*)(?=\n\n---|$)/g,
     (stub, reviewer: string) => {
       const priorSection = priorReviewerSection(priorBody, reviewer);
       return priorSection
@@ -842,20 +1007,26 @@ export async function postReview(
   ref: PullRef,
   review: ReviewOutput,
   inline: readonly Finding[],
-  dropped: readonly Finding[],
+  dropped: readonly Note[],
   logger: Logger,
   opts: PostReviewOptions,
 ): Promise<string> {
   // Snapshot first, post second, clean up last: a failed post must never leave
   // the PR with its old comments gone and no replacement.
-  const prior = await snapshotPriorComments(
-    octokit,
-    ref,
-    opts.reviewerName,
-    opts.priorComments ?? "resolve",
-    logger,
-    opts.refreshPaths,
-  );
+  // Snapshot first, post second, clean up last: a failed post must never leave
+  // the PR with its old comments gone and no replacement. An empty refresh set
+  // means "clean up nothing" (unknown history) — skip the lookup entirely.
+  const prior =
+    opts.refreshPaths?.size === 0
+      ? EMPTY_SNAPSHOT
+      : await snapshotPriorComments(
+          octokit,
+          ref,
+          opts.reviewerName,
+          opts.priorComments ?? "resolve",
+          logger,
+          scopeFor(opts.refreshPaths, opts.headPaths),
+        );
 
   const hasBlocker = [...inline, ...review.concerns].some(
     (f) => f.severity === "blocker",

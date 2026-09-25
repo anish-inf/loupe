@@ -5,6 +5,7 @@ import {
   buildSystemPrompt,
   buildUserPrompt,
   buildVerifySystemPrompt,
+  buildVerifyUserPrompt,
 } from "../src/prompt";
 
 const files: DiffFile[] = [
@@ -76,10 +77,39 @@ describe("buildSystemPrompt reasoning", () => {
 });
 
 describe("buildVerifySystemPrompt", () => {
-  it("fails open on evidence outside the diff instead of rejecting it", () => {
+  it("headless mode fails closed: rejects findings that depend on code outside the diff", () => {
     const p = buildVerifySystemPrompt();
-    expect(p).toContain("outside-diff");
-    expect(p).not.toContain("based on code not shown");
+    expect(p).toContain("headless with NO repository access");
+    expect(p).toContain("speculative from the diff alone: reject it");
+    // The old fail-open "outside-diff" acquittal is gone.
+    expect(p).not.toContain("outside-diff");
+  });
+  it("agentic mode instructs the verifier to read surrounding code and refute false claims", () => {
+    const p = buildVerifySystemPrompt({ agentic: true });
+    expect(p).toContain("repository access");
+    expect(p).toContain("READ the surrounding code");
+    expect(p).toContain("If the surrounding code REFUTES the claim");
+  });
+});
+
+describe("buildVerifyUserPrompt", () => {
+  const f: DiffFile[] = [
+    { path: "src/a.ts", patch: "@@ -1,1 +1,2 @@\n line\n+added" },
+  ];
+  const findings = [
+    { path: "src/a.ts", line: 2, severity: "warning" as const, body: "x" },
+  ];
+
+  it("omits the cwd note by default", () => {
+    const p = buildVerifyUserPrompt(findings, f);
+    expect(p).not.toContain("Your working directory is");
+    expect(p).toContain("#0 [warning] src/a.ts:2");
+  });
+
+  it("includes the cwd→repo path-mapping note for an agentic subdir verify", () => {
+    const p = buildVerifyUserPrompt(findings, f, { cwdSubdir: "svc" });
+    expect(p).toContain("Your working directory is `svc/`");
+    expect(p).toContain("remove the leading `svc/`");
   });
 });
 
@@ -91,6 +121,18 @@ describe("review procedure and call sites", () => {
     expect(
       buildSystemPrompt({ guidance: "x", procedure: false }),
     ).not.toContain("Procedure —");
+  });
+
+  it("puts the evidence bar in the default guidance, not the output contract", () => {
+    const def = buildSystemPrompt({});
+    expect(def).toContain("The bar for a finding (precision over recall)");
+    expect(def).toContain("this input / this path → this wrong result");
+    expect(def).toContain("Hedge the claim, not the report.");
+    // A custom prompt replaces the guidance, so the bar goes with it: a docs
+    // reviewer has no runtime failure to name.
+    expect(buildSystemPrompt({ guidance: "Only hunt bugs." })).not.toContain(
+      "The bar for a finding",
+    );
   });
 
   it("renders pre-computed call sites in the user message", () => {

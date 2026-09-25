@@ -60,6 +60,15 @@ const envSchema = z.object({
   LOUPE_MAX_TURNS: optionalInput,
   LOUPE_MAX_COMMENTS: optionalInput,
   LOUPE_PRIOR_COMMENTS: optionalInput,
+  LOUPE_CROSS_REVIEWER_DEDUP: z
+    .enum(["true", "false"])
+    .default("true")
+    .transform((v) => v === "true"),
+  // Unset input → undefined so a .loupe.json promptCache can win; resolves true
+  // by default in loadConfig (input → file → builtin).
+  LOUPE_PROMPT_CACHE: optionalInput.transform((v) =>
+    v === undefined ? undefined : v === "true",
+  ),
 });
 
 function asMaxTurns(v: string | undefined): number | undefined {
@@ -136,6 +145,10 @@ export type Config = {
   readonly priorComments?: PriorComments;
   /** File value only; core defaults to true. */
   readonly procedure?: boolean;
+  /** Deduplicate the same finding across reviewers before posting (default true). */
+  readonly crossReviewerDedup: boolean;
+  /** Input → file → builtin true. false skips the prompt-cache key. */
+  readonly promptCache?: boolean;
   readonly eventName?: string;
   readonly eventPath?: string;
 };
@@ -189,6 +202,9 @@ export function loadConfig(): Config {
     priorComments:
       asPriorComments(env.LOUPE_PRIOR_COMMENTS) ?? file.priorComments,
     procedure: file.procedure,
+    crossReviewerDedup:
+      env.LOUPE_CROSS_REVIEWER_DEDUP ?? file.crossReviewerDedup ?? true,
+    promptCache: env.LOUPE_PROMPT_CACHE ?? file.promptCache,
     whipConfig: file.whip,
     eventName: env.GITHUB_EVENT_NAME,
     eventPath: env.GITHUB_EVENT_PATH,

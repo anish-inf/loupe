@@ -8,14 +8,21 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { Harness, WhipConfig } from "@loupe/harness";
-import type { HarnessTraceEvent } from "@loupe/harness";
+import {
+  HarnessError,
+  isNonRetryableHarnessError,
+  type Harness,
+  type HarnessTraceEvent,
+  type WhipConfig,
+} from "@loupe/harness";
 import type { Logger } from "@loupe/logger";
 import type { Octokit } from "@octokit/rest";
 import picomatch from "picomatch";
 
 import {
   changedFilesBetween,
+  checkPublishable,
+  cleanupStrandedThreads,
   fetchConventions,
   fetchPullContext,
   getLastReviewed,
@@ -23,6 +30,7 @@ import {
   type PriorComments,
   type PullRef,
   type ReviewDiagnostics,
+  type SkipReason,
 } from "./github";
 import { majority, mergeEnsemble } from "./ensemble";
 import { parseReviewOutput, parseVerification } from "./parse";
@@ -30,6 +38,7 @@ import {
   severityRank,
   severitiesForProfile,
   type Finding,
+  type Note,
   type Profile,
   type ReviewOutput,
 } from "./types";
@@ -121,8 +130,10 @@ export type ReviewRequest = {
   readonly full?: boolean;
   /**
    * Run the review with several models (on the harness) and keep only findings a
-   * majority agree on; minority findings are surfaced as lower-confidence.
-   * Supersedes the verification pass. Needs >= 2 models to take effect.
+   * majority agree on; minority findings are surfaced as lower-confidence. The
+   * verification pass still runs after the merge: majority agreement filters
+   * cross-model noise but not the outside-diff class (several models can agree
+   * on a claim the surrounding code refutes). Needs >= 2 models to take effect.
    */
   readonly ensembleModels?: readonly string[];
   /**
@@ -149,6 +160,16 @@ export type ReviewRequest = {
   /** Post inline findings now, but let the caller aggregate the summary. */
   readonly deferSummary?: boolean;
   /**
+   * Send a stable prompt-cache key to the harness so the provider reuses the
+   * cached system prefix across runs. Default true (a real cost win for models
+   * whose endpoint honors it). Set false for a reviewer whose model rejects
+   * `prompt_cache_key` as an unrecognized argument; those models cache the
+   * stable prefix automatically by prefix match, so the key adds nothing and
+   * its presence can 400. The whip harness also self-heals a cache-key 400 by
+   * retrying without the key, so this flag only skips that wasted round-trip.
+   */
+  readonly promptCache?: boolean;
+  /**
    * Optional trace sink forwarded to every harness call this review makes
    * (its primary run, one-shot fallback, each ensemble model, and the
    * verification pass). When unset, no trace events are emitted.
@@ -163,12 +184,19 @@ export type ReviewResult = {
   readonly requestedChanges: boolean;
   readonly summary: string;
   readonly inline: readonly Finding[];
-  readonly dropped: readonly Finding[];
+  readonly dropped: readonly Note[];
   readonly diagnostics: ReviewDiagnostics;
   /** Rich per-reviewer Markdown used by the action's combined summary. */
   readonly summaryBody?: string;
   /** Present only when this run actually reviewed and published the PR head. */
   readonly reviewedHeadSha?: string;
+  /**
+   * Present when findings were computed but not published because the PR was no
+   * longer safe to post onto (merged, closed, or the head moved since the review
+   * started). The reviewer stays silent on GitHub rather than commenting on a
+   * dead diff. See issue #39.
+   */
+  readonly skipped?: { readonly reason: SkipReason };
 };
 
 /** Default cap on inline comments posted per review; extras go to the summary. */
@@ -182,12 +210,165 @@ const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
   outOfScopeDropped: 0,
   profileDropped: 0,
   verifyDropped: 0,
+  crossReviewerDropped: 0,
   offDiff: 0,
   cappedDropped: 0,
+  salvagedFindings: 0,
+  degradedLegs: [],
 };
 
-/** End-to-end: fetch PR + conventions, run the harness, post the review. */
-export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
+/**
+ * A completed review that hasn't been posted yet — everything `postReview`
+ * needs, captured during the produce phase so a caller can deduplicate across
+ * reviewers before publishing. `empty` marks the no-op cases (no files in
+ * scope, no incremental delta) that carry nothing to post.
+ */
+export type ProducedReview = {
+  readonly reviewerName?: string;
+  readonly review: ReviewOutput;
+  readonly inline: readonly Finding[];
+  readonly uncertain: readonly Finding[];
+  /** Findings ranked out by the comment cap; listed in the summary's collapsed section. */
+  readonly overflow: readonly Finding[];
+  /** The effective maxComments cap applied when ranking overflow out. */
+  readonly commentCap?: number;
+  readonly dropped: readonly Note[];
+  readonly diagnostics: ReviewDiagnostics;
+  /** PR head SHA to stamp in the marker. */
+  readonly headSha: string;
+  /** Prior-comment cleanup scope (paths reassessed this run). */
+  readonly refreshPaths: ReadonlySet<string>;
+  /** Full PR file list at head (for stranded-thread sweeping). */
+  readonly headPaths: ReadonlySet<string>;
+  /** Files in scope, for the stat line. */
+  readonly fileCount: number;
+  /** Nothing to post (no files in scope / no delta since last review). */
+  readonly empty?: { readonly summary: string };
+};
+
+/**
+ * Build a {@link ReviewResult} from a produced review, optionally overriding
+ * the inline findings and diagnostics (after cross-reviewer dedupe). The
+ * requested-changes verdict is recomputed from the (possibly deduped) inline
+ * set so a reviewer whose only blocker was a duplicate doesn't request changes.
+ */
+export function reviewResultFromProduced(
+  produced: ProducedReview,
+  inline: readonly Finding[] = produced.inline,
+  diagnostics: ReviewDiagnostics = produced.diagnostics,
+): ReviewResult {
+  if (produced.empty) {
+    return {
+      inlineCount: 0,
+      droppedCount: 0,
+      requestedChanges: false,
+      summary: produced.empty.summary,
+      inline: [],
+      dropped: [],
+      diagnostics,
+    };
+  }
+  const requestedChanges = [
+    ...inline,
+    ...produced.overflow,
+    ...produced.review.concerns,
+  ].some((f) => f.severity === "blocker");
+  return {
+    inlineCount: inline.length,
+    droppedCount: produced.dropped.length,
+    requestedChanges,
+    summary: produced.review.summary,
+    inline,
+    dropped: produced.dropped,
+    diagnostics,
+  };
+}
+
+/** Options for {@link publishReview} that let a caller adjust what gets posted. */
+export type PublishOptions = {
+  /** Override inline findings (e.g. after cross-reviewer dedupe). */
+  readonly inline?: readonly Finding[];
+  /** Override diagnostics (e.g. with crossReviewerDropped filled in). */
+  readonly diagnostics?: ReviewDiagnostics;
+  /** What to do with prior inline comments (default resolve). */
+  readonly priorComments?: PriorComments;
+  /** Let a higher-level orchestrator publish one summary for all reviewers. */
+  readonly deferSummary?: boolean;
+};
+
+/**
+ * Post a produced review as inline comments + (unless deferred) a summary.
+ * A caller that deduplicated across reviewers passes the deduped `inline` and
+ * updated `diagnostics` so only the surviving findings post and the run-details
+ * line reflects the suppressed duplicates.
+ */
+export async function publishReview(
+  octokit: Octokit,
+  ref: PullRef,
+  produced: ProducedReview,
+  logger: Logger,
+  opts?: PublishOptions,
+): Promise<string> {
+  const inline = opts?.inline ?? produced.inline;
+  const diagnostics = opts?.diagnostics ?? produced.diagnostics;
+  const reviewForPost = reviewForPosting(
+    produced.review,
+    produced.uncertain,
+    produced.overflow,
+    produced.commentCap,
+  );
+  return postReview(
+    octokit,
+    ref,
+    reviewForPost,
+    inline,
+    produced.dropped,
+    logger,
+    {
+      reviewerName: produced.reviewerName,
+      headSha: produced.headSha,
+      refreshPaths: produced.refreshPaths,
+      headPaths: produced.headPaths,
+      fileCount: produced.fileCount,
+      priorComments: opts?.priorComments,
+      diagnostics,
+      deferSummary: opts?.deferSummary,
+    },
+  );
+}
+
+/** Attach the collapsed lower-confidence (ensemble minority) section to a review. */
+function reviewForPosting(
+  review: ReviewOutput,
+  uncertain: readonly Finding[],
+  overflow: readonly Finding[] = [],
+  maxComments?: number,
+): ReviewOutput {
+  const uncertainNote =
+    uncertain.length > 0
+      ? `\n\n<details><summary>Lower-confidence findings (raised by a minority of models)</summary>\n\n${uncertain
+          .map((f) => `- \`${f.path}:${f.line}\` [${f.severity}] ${f.body}`)
+          .join("\n")}\n\n</details>`
+      : "";
+  // Findings demoted by the comment cap go in a collapsed section too, so
+  // nothing is lost — they are just no longer inline comments.
+  const cap = maxComments ?? DEFAULT_MAX_COMMENTS;
+  const overflowNote =
+    overflow.length > 0
+      ? `\n\n<details><summary>Additional findings (ranked below the ${cap}-comment cap)</summary>\n\n${overflow
+          .map((f) => `- \`${f.path}:${f.line}\` [${f.severity}] ${f.body}`)
+          .join("\n")}\n\n</details>`
+      : "";
+  return {
+    ...review,
+    summary: `${review.summary}${uncertainNote}${overflowNote}`,
+  };
+}
+
+/** Run the harness and produce a review without posting it. */
+export async function produceReview(
+  req: ReviewRequest,
+): Promise<ProducedReview> {
   const { logger } = req;
   const dirs = (req.dirs ?? [])
     .map((d) => d.replace(/^\/+|\/+$/g, ""))
@@ -243,22 +424,32 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     return true;
   });
 
-  const emptyResult = (summary: string): ReviewResult => ({
-    inlineCount: 0,
-    droppedCount: 0,
-    requestedChanges: false,
-    summary,
+  const emptyDiagnostics: ReviewDiagnostics = {
+    ...CLEAN_DIAGNOSTICS,
+    mode: (req.agentic ?? true) ? "agentic" : "headless",
+  };
+
+  // Nothing to post: no files in scope, or no delta since the last review.
+  // These still return a ProducedReview so a caller can build a ReviewResult,
+  // but `empty` marks that there is nothing to publish.
+  const emptyProduced = (summary: string): ProducedReview => ({
+    reviewerName: req.reviewerName,
+    review: { summary, findings: [], concerns: [], highlights: [] },
     inline: [],
+    uncertain: [],
+    overflow: [],
     dropped: [],
-    diagnostics: {
-      ...CLEAN_DIAGNOSTICS,
-      mode: (req.agentic ?? true) ? "agentic" : "headless",
-    },
+    diagnostics: emptyDiagnostics,
+    headSha: pull.headSha,
+    refreshPaths: new Set(),
+    headPaths: pull.headPaths,
+    fileCount: 0,
+    empty: { summary },
   });
 
   if (scopedFiles.length === 0) {
     logger.info("No changed files in scope; nothing to review", { dirs });
-    return emptyResult("No changed files in scope.");
+    return emptyProduced("No changed files in scope.");
   }
 
   // Incremental review: reassess only the in-scope files changed since this
@@ -300,7 +491,23 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
           logger.info(
             "No in-scope files changed since last review; keeping prior comments",
           );
-          return emptyResult("No in-scope changes since the last review.");
+          // Even with nothing to reassess, threads stranded by a rename or
+          // deletion since the last review would otherwise sit there forever,
+          // since no scoped refresh will ever reach them. Skipped on dry runs,
+          // which must not mutate the PR.
+          if (!req.dryRun) {
+            await cleanupStrandedThreads(
+              octokit,
+              req.ref,
+              pull.headPaths,
+              logger,
+              {
+                reviewerName: req.reviewerName,
+                priorComments: req.priorComments,
+              },
+            );
+          }
+          return emptyProduced("No in-scope changes since the last review.");
         }
       } catch (err) {
         logger.warn(
@@ -348,13 +555,14 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   // it actually exists on disk; fall back to the workdir (or cwd) so a run
   // without a local checkout — the whole diff is in the prompt — still spawns.
   const scoped = subdir ? join(req.workdir, subdir) : req.workdir;
-  const harnessCwd = existsSync(scoped)
+  const hasCheckout = existsSync(scoped);
+  const harnessCwd = hasCheckout
     ? scoped
     : existsSync(req.workdir)
       ? req.workdir
       : process.cwd();
 
-  if (agentic && !existsSync(scoped)) {
+  if (agentic && !hasCheckout) {
     logger.warn(
       "Agentic review has no matching checkout on disk; the agent can't inspect real files. Pass --workdir pointing at a checkout, or set agentic: false.",
       { scoped, fallbackCwd: harnessCwd },
@@ -411,8 +619,14 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     : headlessUserPrompt;
 
   // Stable prompt-cache key per repo+reviewer so whip reuses the cached system
-  // prefix across runs (and its own turns within a run).
-  const cacheKey = `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}`;
+  // prefix across runs (and its own turns within a run). Omitted when a
+  // reviewer opted out of prompt caching (promptCache:false) — a model whose
+  // endpoint rejects prompt_cache_key. whip then never sends -cache-key, so no
+  // 400 and no self-heal retry. Those models cache the prefix by match anyway.
+  const cacheKey =
+    req.promptCache !== false
+      ? `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}`
+      : undefined;
 
   // Noise profile: hard-filter by severity (the prompt asks too, this enforces).
   const keep = new Set(severitiesForProfile(profile));
@@ -421,6 +635,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     mode: (agentic ? "agentic" : "headless") as ReviewDiagnostics["mode"],
     malformedFindings: 0,
     malformedConcerns: 0,
+    salvagedFindings: 0,
     outOfScope: 0,
     profileDropped: 0,
   };
@@ -437,7 +652,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   ): Promise<{
     inline: Finding[];
     review: ReviewOutput;
-    dropped: Finding[];
+    dropped: Note[];
   }> => {
     logger.info("Running harness", {
       harness: req.harness.name,
@@ -471,12 +686,23 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     try {
       parsed = await run(agentic, model ? `${tag}:${model}` : tag);
     } catch (err) {
-      if (!agentic) throw err;
+      // Agentic runs can run away (hit the tool-turn cap) or otherwise fail;
+      // fall back to a one-shot diff-only review so we still post something.
+      // A quota/rate-limit failure is not helped by switching modes (same
+      // provider, same billing/throttle), so re-throw immediately instead of
+      // spending a second doomed call per reviewer.
+      if (!agentic || isNonRetryableHarnessError(err)) throw err;
       logger.warn("Agentic review failed; retrying one-shot from the diff", {
         error: err instanceof Error ? err.message : String(err),
+        kind: err instanceof HarnessError ? err.kind : undefined,
       });
-      counts.mode = "fallback";
+      // Set the fallback mode only once the headless retry actually resolves.
+      // In an ensemble, this runs per leg against shared counts; a leg that
+      // dies on the fallback too must not leave "fallback" behind to taint the
+      // survivors' mode (otherwise a fully-agentic survivor review renders as
+      // "headless fallback (agentic run failed)" in Run details).
       parsed = await run(false, model ? `fallback:${model}` : "fallback");
+      counts.mode = "fallback";
     }
     counts.malformedFindings += parsed.malformedFindings;
     counts.malformedConcerns += parsed.malformedConcerns;
@@ -484,10 +710,19 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     // context file would duplicate a prior comment we deliberately kept.
     const inScope = parsed.review.findings.filter((f) => focus.has(f.path));
     counts.outOfScope += parsed.review.findings.length - inScope.length;
+    // Salvaged findings have no anchor to validate, so they go straight to the
+    // off-diff notes — under the same scope rule as everything else.
+    const salvaged = parsed.salvagedFindings.filter((f) => focus.has(f.path));
+    counts.salvagedFindings += salvaged.length;
+    counts.outOfScope += parsed.salvagedFindings.length - salvaged.length;
     const validated = validateFindings(inScope, files);
     const inline = validated.inline.filter((f) => keep.has(f.severity));
     counts.profileDropped += validated.inline.length - inline.length;
-    return { inline, review: parsed.review, dropped: [...validated.dropped] };
+    return {
+      inline,
+      review: parsed.review,
+      dropped: [...validated.dropped, ...salvaged],
+    };
   };
 
   const ensemble =
@@ -496,21 +731,47 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
       : undefined;
 
   let review: ReviewOutput;
-  let dropped: Finding[];
+  let dropped: Note[];
   let inline: Finding[];
   let uncertain: Finding[] = [];
   let verify: ReviewDiagnostics["verify"] = "skipped";
   let verifyDropped = 0;
+  // Models that failed and were dropped from an ensemble merge so the
+  // surviving legs' findings still post. Stays empty for a non-ensemble run or
+  // a fully-successful one; populated per leg below. Surfaced on the summary as
+  // a degraded-run note so a lost leg never reads as silence.
+  let failedLegs: string[] = [];
 
   if (ensemble) {
     logger.info("Ensemble review", { models: ensemble });
-    const [firstModel, ...restModels] = ensemble;
-    const firstRun = await produceOne(firstModel, "ensemble");
-    const runs = [firstRun];
-    for (const model of restModels)
-      runs.push(await produceOne(model, "ensemble")); // sequential
-    review = firstRun.review;
-    dropped = firstRun.dropped;
+    const runs: { inline: Finding[]; review: ReviewOutput; dropped: Note[] }[] =
+      [];
+    for (const model of ensemble) {
+      try {
+        runs.push(await produceOne(model, "ensemble"));
+      } catch (err) {
+        const legModel = model ?? "(harness default)";
+        failedLegs.push(legModel);
+        logger.warn("Ensemble leg failed; degrading to remaining models", {
+          model: legModel,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+    // Borrow the review body (summary/concerns/highlights) from the first
+    // surviving leg, not the first configured leg — the first leg may be one
+    // that failed. If no leg survived, let the reviewer-level failure path post
+    // the ⚠️ comment and exit 1 rather than posting a vacuous "clean" review.
+    const [firstSurvivor] = runs;
+    if (!firstSurvivor) {
+      throw new Error(`all ensemble models failed: ${failedLegs.join(", ")}`);
+    }
+    review = firstSurvivor.review;
+    dropped = firstSurvivor.dropped;
+    // Keep the majority threshold relative to the configured panel, not the
+    // survivors: a lone survivor's findings have models.size < threshold and
+    // flow into the existing lower-confidence section — the honest claim for a
+    // degraded ensemble, never a false "majority confirmed".
     const merged = mergeEnsemble(
       runs.map((r) => r.inline),
       majority(ensemble.length),
@@ -520,19 +781,36 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     logger.info("Ensemble merged", {
       confirmed: inline.length,
       uncertain: uncertain.length,
+      degradedLegs: failedLegs,
     });
   } else {
     const one = await produceOne(req.model);
     review = one.review;
     dropped = one.dropped;
     inline = one.inline;
-    // Verification pass: a cheap second opinion that drops false positives.
-    if (req.verify !== false && inline.length > 0) {
-      const v = await verifyInline(req, files, inline, harnessCwd);
-      verify = v.status;
-      verifyDropped = inline.length - v.kept.length;
-      inline = v.kept;
-    }
+  }
+
+  // Verification pass: a second opinion that drops false positives. Runs after
+  // both a single-model review and an ensemble merge — majority agreement
+  // filters cross-model noise but not the outside-diff class (several models
+  // can agree on a claim the surrounding code refutes), so the verifier still
+  // reads the checkout and marks `real: false` when it does. When the review
+  // was agentic and a real checkout exists, verify agentic too so the verifier
+  // can read the surrounding code that refutes (or confirms) each finding
+  // — instead of acquitting outside-diff claims it can't see.
+  if (req.verify !== false && inline.length > 0) {
+    const v = await verifyInline(
+      req,
+      files,
+      inline,
+      harnessCwd,
+      agentic,
+      hasCheckout,
+      subdir && harnessCwd === scoped ? subdir : undefined,
+    );
+    verify = v.status;
+    verifyDropped = inline.length - v.kept.length;
+    inline = v.kept;
   }
 
   if (dropped.length > 0) {
@@ -568,108 +846,147 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     outOfScopeDropped: counts.outOfScope,
     profileDropped: counts.profileDropped,
     verifyDropped,
+    crossReviewerDropped: 0,
     offDiff: dropped.length,
     cappedDropped: overflow.length,
+    salvagedFindings: counts.salvagedFindings,
+    degradedLegs: failedLegs,
   };
 
-  // Ensemble minority findings go in a collapsed lower-confidence section.
-  const uncertainNote =
-    uncertain.length > 0
-      ? `\n\n<details><summary>Lower-confidence findings (raised by a minority of models)</summary>\n\n${uncertain
-          .map((f) => `- \`${f.path}:${f.line}\` [${f.severity}] ${f.body}`)
-          .join("\n")}\n\n</details>`
-      : "";
-  // Findings demoted by the comment cap go in a collapsed section too, so
-  // nothing is lost — they are just no longer inline comments.
-  const overflowNote =
-    overflow.length > 0
-      ? `\n\n<details><summary>Additional findings (ranked below the ${maxComments}-comment cap)</summary>\n\n${overflow
-          .map((f) => `- \`${f.path}:${f.line}\` [${f.severity}] ${f.body}`)
-          .join("\n")}\n\n</details>`
-      : "";
-  const reviewForPost: ReviewOutput = {
-    ...review,
-    summary: `${review.summary}${uncertainNote}${overflowNote}`,
-  };
-
-  // A blocker among the demoted findings still requests changes.
-  const requestedChanges = [...inline, ...overflow, ...review.concerns].some(
-    (f) => f.severity === "blocker",
-  );
-  const verdict = requestedChanges ? "REQUEST_CHANGES" : "COMMENT";
-  const result: ReviewResult = {
-    inlineCount: inline.length,
-    droppedCount: dropped.length,
-    requestedChanges,
-    summary: review.summary,
+  const produced: ProducedReview = {
+    reviewerName: req.reviewerName,
+    review,
     inline,
+    uncertain,
+    overflow,
+    commentCap: maxComments,
     dropped,
     diagnostics,
+    headSha: pull.headSha,
+    refreshPaths,
+    headPaths: pull.headPaths,
+    fileCount: files.length,
   };
 
+  logger.info("Review produced", {
+    reviewer: req.reviewerName ?? "default",
+    inline: inline.length,
+    uncertain: uncertain.length,
+    dropped: dropped.length,
+    profile,
+    diagnostics,
+  });
+
+  return produced;
+}
+
+/**
+ * End-to-end: produce a review and post it immediately. A single-reviewer run
+ * (or the CLI) uses this; the multi-reviewer orchestrator calls
+ * {@link produceReview} for each reviewer, deduplicates the union, then posts
+ * via {@link publishReview} so the same reworded claim posts once.
+ */
+export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
+  const { logger } = req;
+  const produced = await produceReview(req);
+
+  if (produced.empty) {
+    const result = reviewResultFromProduced(produced);
+    if (req.dryRun) logger.info("Dry run — nothing to post");
+    return result;
+  }
+
+  const result = reviewResultFromProduced(produced);
   if (req.dryRun) {
     logger.info("Dry run — not posting review", {
-      verdict,
-      profile,
-      inline: inline.length,
-      uncertain: uncertain.length,
-      summary: review.summary,
-      diagnostics,
+      profile: req.profile ?? "chill",
+      inline: produced.inline.length,
+      uncertain: produced.uncertain.length,
+      summary: produced.review.summary,
+      diagnostics: produced.diagnostics,
     });
     return result;
   }
 
-  const summaryBody = await postReview(
-    octokit,
+  // The review ran for minutes; the PR can merge, close, or receive a new push
+  // in that window. Re-read it right before publishing and stay silent if it is
+  // no longer safe to post onto — findings anchored to a dead diff read as the
+  // author ignoring a tool they never had a chance to act on (issue #39). The
+  // findings stay on the result for the trace; only the GitHub writes are
+  // suppressed. The check itself failing open: a lookup error proceeds to post,
+  // since a stale-but-correct finding is better than a silent dropped review.
+  const publishable = await checkPublishable(
+    req.octokit,
     req.ref,
-    reviewForPost,
-    inline,
-    dropped,
-    logger,
+    produced.headSha,
+  ).catch((err: unknown) => {
+    logger.warn("Publishability check failed; posting anyway", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { publishable: true } as const;
+  });
+  if (!publishable.publishable) {
+    logger.warn("Skipping publish — PR no longer safe to post onto", {
+      reviewer: req.reviewerName ?? "default",
+      reason: publishable.reason,
+      inline: produced.inline.length,
+      dropped: produced.dropped.length,
+    });
+    return { ...result, skipped: { reason: publishable.reason } };
+  }
+
+  const summaryBody = await publishReview(
+    req.octokit,
+    req.ref,
+    produced,
+    req.logger,
     {
-      reviewerName: req.reviewerName,
-      headSha: pull.headSha,
-      refreshPaths,
-      fileCount: files.length,
       priorComments: req.priorComments,
-      diagnostics,
       deferSummary: req.deferSummary,
     },
   );
   logger.info("Posted review", {
     reviewer: req.reviewerName ?? "default",
-    inline: inline.length,
-    dropped: dropped.length,
-    verdict,
-    diagnostics,
+    inline: produced.inline.length,
+    dropped: produced.dropped.length,
+    diagnostics: produced.diagnostics,
   });
 
-  return { ...result, summaryBody, reviewedHeadSha: pull.headSha };
+  return { ...result, summaryBody, reviewedHeadSha: produced.headSha };
 }
 
-/**
- * Ask the harness to judge each finding real or not; drop the ones it rejects.
- * One-shot (never agentic). Fail-open: an error or an incomplete/invalid
- * verdict set keeps every finding and reports why.
- */
+/** Ask the harness to judge each finding real or not; drop the ones it rejects.
+ * Agentic when the review was agentic and a real checkout exists (reads the
+ * surrounding code to confirm or refute each finding); one-shot from the diff
+ * otherwise. Fail-open: an error or an incomplete/invalid verdict set keeps
+ * every finding and reports why. */
 async function verifyInline(
   req: ReviewRequest,
   files: readonly { path: string; patch: string | undefined }[],
   findings: readonly Finding[],
   harnessCwd: string,
+  agentic: boolean,
+  hasCheckout: boolean,
+  cwdSubdir?: string,
 ): Promise<{ kept: Finding[]; status: ReviewDiagnostics["verify"] }> {
+  const verifyAgentic = agentic && hasCheckout;
   try {
     const stdout = await req.harness.review({
-      systemPrompt: buildVerifySystemPrompt(),
-      userPrompt: buildVerifyUserPrompt(findings, files),
+      systemPrompt: buildVerifySystemPrompt({ agentic: verifyAgentic }),
+      userPrompt: buildVerifyUserPrompt(findings, files, {
+        cwdSubdir: verifyAgentic ? cwdSubdir : undefined,
+      }),
       model: req.model,
-      agentic: false,
+      agentic: verifyAgentic,
       workdir: harnessCwd,
       env: req.harnessEnv,
       whipConfig: req.whipConfig,
       maxTurns: req.maxTurns,
       reasoning: req.reasoning,
-      cacheKey: `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}/verify`,
+      cacheKey:
+        req.promptCache !== false
+          ? `loupe/${req.ref.owner}/${req.ref.repo}/${req.reviewerName ?? "default"}/verify`
+          : undefined,
       trace: req.trace,
       phase: req.model ? `verify:${req.model}` : "verify",
       logger: req.logger,
@@ -698,11 +1015,13 @@ async function verifyInline(
       before: findings.length,
       after: kept.length,
       dropped: findings.length - kept.length,
+      agentic: verifyAgentic,
     });
     return { kept, status: "passed" };
   } catch (err) {
     req.logger.warn("Verification pass failed; keeping all findings", {
       error: err instanceof Error ? err.message : String(err),
+      agentic: verifyAgentic,
     });
     return { kept: [...findings], status: "failed" };
   }

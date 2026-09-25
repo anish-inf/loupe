@@ -43,8 +43,10 @@ whose globs match a changed file and posts each as its own labeled review
 | `ensemble` | no | `["kimi-k3","glm-5.2-fast"]` — run several models, keep findings a majority agree on. |
 | `skills` | no | Paths to skill docs (a `SKILL.md` or a skill dir) folded into the reviewer, e.g. `[".agents/skills/i-have-adhd"]` to enforce a terse output style. |
 | `procedure` | no | `false` drops the always-on review procedure (caller check, wrapper rule) from this reviewer's prompt. Also a top-level default. |
+| `promptCache` | no | `false` (default `true`) suppresses the stable prompt-cache key loupe sends so the provider reuses the cached system prefix. Set `false` for a reviewer whose model rejects `prompt_cache_key` as an unrecognized argument (e.g. some OpenAI-compatible endpoints strict-validate unknown fields); those models cache the prefix automatically by match, so the key adds nothing and its presence can 400. Also a top-level default and the `prompt-cache` Action input / `--no-prompt-cache` flag. The whip harness also self-heals a cache-key 400 by retrying without the key, so this flag only skips that wasted round-trip. |
 | `priorComments` | no | What happens to this reviewer's earlier inline comments on a re-review: `resolve` (default: resolve the thread, history kept) \| `delete` \| `keep` (leave them, new comments accumulate). Also a top-level default and the `prior-comments` Action input / `--prior-comments` flag. |
 | `maxComments` | no | Max inline comments posted (default 10). Extras are ranked out by severity and listed in a collapsed "Additional findings" section of the summary; a demoted blocker still requests changes. Also a top-level default and the `max-comments` Action input / `--max-comments` flag. |
+| `crossReviewerDedup` | no | `false` lets the same finding post from multiple reviewers (no dedup). Default `true`: before posting, the union of all reviewers' inline findings is deduplicated so the same reworded claim posts once. Also a top-level default and the `cross-reviewer-dedup` Action input. |
 
 Globs are matched against repo-relative paths. `include` composes with `dir`.
 
@@ -128,13 +130,20 @@ Two scopes:
 
 ## Signal-to-noise features
 
-- **Verification pass** (on by default) — after findings are produced, a cheap
-  second inference judges each one real or not against the diff; rejected
-  findings are dropped. Turn off with `verify: false` / `--no-verify`.
+- **Verification pass** (on by default) — after findings are produced, a second
+  inference judges each one real or not; rejected findings are dropped. When the
+  review is agentic and a checkout exists, the verifier runs agentic too — it
+  reads the surrounding code to confirm or refute each finding (e.g. whether an
+  early return makes a crash unreachable, whether a caller nulls a value), so
+  outside-diff claims are checked against the real code instead of acquitting
+  them. In one-shot mode it judges from the diff alone and rejects claims that
+  depend on code it can't see. Turn off with `verify: false` / `--no-verify`.
 - **Ensemble** — run the review across several models (`ensemble` /
   `--ensemble`); only findings a majority agree on are posted, the rest go to a
-  lower-confidence section. Supersedes the verification pass. Higher precision at
-  N× the review cost.
+  lower-confidence section. The verification pass still runs after the merge:
+  majority agreement filters cross-model noise but not the outside-diff class
+  (several models can agree on a claim the surrounding code refutes), so the
+  verifier still reads the checkout. Higher precision at N× the review cost.
 - **Noise profile** — `quiet` posts only blockers, `chill` (default) blockers +
   warnings, `assertive` everything. Both prompt-level and a hard severity
   filter.

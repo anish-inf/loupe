@@ -73,10 +73,11 @@ and only works on same-repo branches, not forks.
 
 `harness`, `model`, `reasoning`, `profile`, `verify`, `full`, `prompt-file`,
 `config`, `reviewer`, `dir`, `convention-paths`, `credential-providers`,
-`ensemble`, `skills`, `timezone`, `max-turns`, `max-comments`, `prior-comments` (default
-`resolve`), `github-token`. Each maps to a `LOUPE_*` env var (see below); config/prompt
-paths resolve against `GITHUB_WORKSPACE` (the checkout), not the action's own
-directory.
+`ensemble`, `skills`, `timezone`, `max-turns`, `max-comments`, `cross-reviewer-dedup` (default `true`), `prompt-cache` (default
+`true`), `prior-comments` (default
+`resolve`), `github-token`. Each maps to a `LOUPE_*` env var (see below);
+config/prompt paths resolve against `GITHUB_WORKSPACE` (the checkout), not the
+action's own directory.
 
 ## Env vars
 
@@ -87,8 +88,8 @@ The entrypoint reads only these (parsed in `packages/action/src/config.ts`):
 `LOUPE_CONVENTION_PATHS`, `LOUPE_CREDENTIAL_PROVIDERS`, `LOUPE_INFISICAL_ENV`,
 `LOUPE_INFISICAL_PROJECT_ID`, `LOUPE_PROFILE`, `LOUPE_VERIFY`, `LOUPE_FULL`,
 `LOUPE_ENSEMBLE`, `LOUPE_SKILLS`, `LOUPE_TIMEZONE`, `LOUPE_MAX_TURNS`,
-`LOUPE_MAX_COMMENTS`,
-`LOUPE_PRIOR_COMMENTS`.
+`LOUPE_ENSEMBLE`, `LOUPE_SKILLS`, `LOUPE_TIMEZONE`, `LOUPE_MAX_TURNS`,
+`LOUPE_MAX_COMMENTS`, `LOUPE_PRIOR_COMMENTS`, `LOUPE_CROSS_REVIEWER_DEDUP`, `LOUPE_PROMPT_CACHE`.
 Comment/chat mode is auto-detected from `GITHUB_EVENT_NAME` (`issue_comment` /
 `pull_request_review_comment`), which the runner sets.
 
@@ -120,3 +121,33 @@ gh api -X PUT repos/context-labs/loupe/actions/permissions/access \
   so drafts are ignored and rapid pushes collapse to the latest commit.
 - **De-dup:** loupe deletes each reviewer's prior comments before re-posting, so
   re-reviews replace rather than accumulate.
+## Branching on failure
+
+The action exposes a `status` output so a workflow can detect a failed review
+even while `continue-on-error: true` keeps it advisory. Give the step an id and
+read `steps.<id>.outputs.status`:
+
+```yaml
+- id: loupe-run
+  uses: context-labs/loupe@v0
+  continue-on-error: true
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+- if: steps.loupe-run.outputs.status == 'quota'
+  run: |
+    echo "loupe hit a billing/quota limit — ping #billing"
+    # e.g. send a Slack alert or open a tracking issue
+- if: steps.loupe-run.outputs.status == 'rate-limit'
+  run: echo "loupe was throttled; consider requeuing with backoff"
+```
+
+`status` is one of `ok | quota | rate-limit | failed`:
+
+- `ok` — review completed and was posted.
+- `quota` — the provider rejected the call for a billing reason (HTTP 402,
+  insufficient balance, quota exceeded). The one-shot fallback is **not**
+  retried for this kind, so it costs one call per reviewer, not two.
+- `rate-limit` — the provider throttled the call (HTTP 429, rate limit
+  exceeded). Also not retried via the mode-switch fallback.
+- `failed` — any other failure (harness crash, transient error, etc.). The
+  agentic→one-shot fallback still runs for unclassified errors.

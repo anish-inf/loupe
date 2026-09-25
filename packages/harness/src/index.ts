@@ -5,9 +5,16 @@ import { join } from "node:path";
 
 import type { Logger } from "@loupe/logger";
 
+import { HarnessError, classifyHarnessError } from "./errors";
 import type { HarnessTraceEvent } from "./trace";
 import { envSecretValues, redactSecrets } from "./trace";
 
+export {
+  HarnessError,
+  classifyHarnessError,
+  isNonRetryableHarnessError,
+  type HarnessErrorKind,
+} from "./errors";
 export * from "./trace";
 
 /**
@@ -146,7 +153,9 @@ function runCli(
     });
     child.on("error", (err) => {
       emit({ type: "error", error: err.message });
-      reject(err);
+      reject(
+        new HarnessError(err instanceof Error ? err.message : String(err)),
+      );
     });
     child.on("close", (code) => {
       log.debug("Harness exited", { code, stdoutChars: stdout.length });
@@ -155,9 +164,9 @@ function runCli(
         emit({ type: "done", text: stdout });
         resolve(stdout);
       } else {
-        const error = `${cmd} exited ${code}: ${stderr.slice(0, 2000)}`;
-        emit({ type: "error", error });
-        reject(new Error(error));
+        const message = `${cmd} exited ${code}: ${stderr.slice(0, 2000)}`;
+        emit({ type: "error", error: message });
+        reject(new HarnessError(message, classifyHarnessError(message)));
       }
     });
     child.stdin.write(stdin);
@@ -309,9 +318,11 @@ function runWhipStreaming(
         case "done":
           final = typeof event["text"] === "string" ? event["text"] : text;
           break;
-        case "error":
-          reject(new Error(`whip error: ${JSON.stringify(event["error"])}`));
+        case "error": {
+          const message = `whip error: ${JSON.stringify(event["error"])}`;
+          reject(new HarnessError(message, classifyHarnessError(message)));
           break;
+        }
         default:
           log.debug("event", event);
       }
@@ -328,13 +339,18 @@ function runWhipStreaming(
       stderr += chunk;
       log.debug(chunk.trimEnd());
     });
-    child.on("error", reject);
+    child.on("error", (e) =>
+      reject(new HarnessError(e instanceof Error ? e.message : String(e))),
+    );
     child.on("close", (code) => {
       if (buffer.trim()) handle(buffer);
       const out = final ?? text;
       log.debug("Harness exited", { code, replyChars: out.length });
       if (code === 0) resolve(out);
-      else reject(new Error(`whip exited ${code}: ${stderr.slice(0, 2000)}`));
+      else {
+        const message = `whip exited ${code}: ${stderr.slice(0, 2000)}`;
+        reject(new HarnessError(message, classifyHarnessError(message)));
+      }
     });
     child.stdin.write(ctx.userPrompt);
     child.stdin.end();
@@ -439,6 +455,30 @@ export function materializeWhipHome(
 }
 
 /**
+ * Decide whether a whip failure is a prompt-cache-key incompatibility worth one
+ * retry without the key. Two cases, both requiring a key was actually sent:
+ *   1. an older whip that predates the `-cache-key` flag ("flag provided but
+ *      not defined: -cache-key"); and
+ *   2. a provider that accepts the flag but rejects the resulting
+ *      `prompt_cache_key` argument as unrecognized — some OpenAI-compatible
+ *      endpoints strict-validate unknown fields. Those providers cache the
+ *      stable system prefix automatically by prefix match, so dropping the key
+ *      costs nothing and unblocks the model.
+ * Exported so the retry condition is unit-testable without spawning whip.
+ */
+export function shouldRetryWithoutCacheKey(
+  err: unknown,
+  cacheKey?: string,
+): boolean {
+  if (!cacheKey) return false;
+  const msg = String(err);
+  return (
+    /flag provided but not defined: -cache-key/.test(msg) ||
+    /prompt_cache_key/i.test(msg)
+  );
+}
+
+/**
  * whip (context-labs custom harness): runs `whip run --format json` and streams
  * the event log live. `-system` sets the reviewer/output/headless instructions.
  * By default it self-authenticates from its own local login (~/.whip/); when a
@@ -486,14 +526,14 @@ export function whipHarness(): Harness {
         ? [...args, "-cache-key", ctx.cacheKey]
         : args;
       return runWhipStreaming(withKey, runCtx).catch((err: unknown) => {
-        if (
-          ctx.cacheKey &&
-          /flag provided but not defined: -cache-key/.test(String(err))
-        ) {
+        // A reviewer that opted out via promptCache:false has cacheKey
+        // undefined, so this never fires for it — no wasted retry.
+        if (shouldRetryWithoutCacheKey(err, ctx.cacheKey)) {
           ctx.logger
             .child("whip")
             .warn(
-              "whip does not support -cache-key; retrying without it. Upgrade whip to enable prompt caching.",
+              "prompt cache key rejected; retrying without it. " +
+                "Set promptCache:false to skip this retry.",
             );
           return runWhipStreaming(args, runCtx);
         }
