@@ -1,5 +1,11 @@
 import { spawn } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -106,6 +112,92 @@ function commandExists(cmd: string): Promise<boolean> {
     p.on("error", () => resolve(false));
     p.on("close", (code) => resolve(code === 0));
   });
+}
+
+/**
+ * whip v0.6.5 — the pinned release loupe installs on demand. The latest whip
+ * release (v1.0.0+) renamed the binary to `whipcode` and broke the harness, so
+ * when a user selects harness "whip" and no `whip` is on PATH, loupe downloads
+ * this exact tag instead of failing with "CLI is not installed."
+ */
+const PINNED_WHIP_TAG = "v0.6.5";
+
+/**
+ * Install the pinned whip release into loupe's private bin dir (~/.loupe/bin)
+ * and return its absolute path, or null on failure. Used as the fallback when
+ * the user selected harness "whip" but no usable `whip` binary is available —
+ * e.g. after the upstream v1.0.0 release renamed the CLI and the installed
+ * `whip` vanished (replaced by `whipcode`), leaving reviews failing with
+ * "Harness \"whip\" CLI is not installed."
+ */
+function installPinnedWhip(logger: Logger): Promise<string | null> {
+  const home = process.env.HOME ?? tmpdir();
+  const binDir = join(home, ".loupe", "bin");
+  mkdirSync(binDir, { recursive: true });
+  const dest = join(binDir, "whip");
+  // Already downloaded by a previous run — reuse it.
+  try {
+    accessSync(dest);
+    chmodSync(dest, 0o755);
+    return Promise.resolve(dest);
+  } catch {
+    // fall through to a fresh download
+  }
+  const mode =
+    process.platform === "darwin" && process.arch === "arm64"
+      ? "darwin-arm64"
+      : process.platform === "darwin"
+        ? "darwin-x64"
+        : process.platform === "linux" && process.arch === "arm64"
+          ? "linux-arm64"
+          : "linux-x64";
+  const url = `https://github.com/context-labs/whip/releases/download/${PINNED_WHIP_TAG}/whip-${mode}`;
+  return new Promise((resolve) => {
+    const child = spawn("curl", ["-fsSL", "--retry", "2", "-o", dest, url]);
+    child.on("error", (err) => {
+      logger.warn("pinned whip download failed to start", {
+        error: String(err),
+      });
+      resolve(null);
+    });
+    child.on("close", (code) => {
+      if (code !== 0) {
+        logger.warn("pinned whip download failed", { code, url });
+        resolve(null);
+      }
+      try {
+        chmodSync(dest, 0o755);
+        resolve(dest);
+      } catch (err) {
+        logger.warn("failed to chmod pinned whip", { error: String(err) });
+        resolve(null);
+      }
+    });
+  });
+}
+
+/**
+ * Resolve the `whip` binary the whip harness spawns: the `whip` on PATH if
+ * present, else the pinned v0.6.5 release downloaded into loupe's private bin
+ * dir. Returns null only when neither is possible (no PATH binary and the
+ * download failed). Exported for unit-testing the resolution contract.
+ */
+async function resolveWhipBinary(
+  logger: Logger | null,
+): Promise<string | null> {
+  if (await commandExists("whip")) return "whip";
+  return installPinnedWhip(
+    logger ??
+      ({
+        // Stub logger so the availability check (a bare boolean probe) can run
+        // without a real Logger; failures here only affect the download path.
+        debug: () => {},
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        child: () => null as unknown as Logger,
+      } as unknown as Logger),
+  );
 }
 
 /**
@@ -235,6 +327,7 @@ export function codexHarness(): Harness {
 function runWhipStreaming(
   args: readonly string[],
   ctx: HarnessContext,
+  binary = "whip",
 ): Promise<string> {
   const log = ctx.logger.child("whip");
   // Known secrets (resolved credential values handed to the subprocess via env)
@@ -263,7 +356,7 @@ function runWhipStreaming(
     });
   log.debug("Spawning harness", { args, cwd: ctx.workdir, model: ctx.model });
   return new Promise((resolve, reject) => {
-    const child = spawn("whip", args, {
+    const child = spawn(binary, args, {
       cwd: ctx.workdir,
       env: { ...process.env, ...ctx.env },
     });
@@ -485,13 +578,25 @@ export function shouldRetryWithoutCacheKey(
  * `whipConfig` is supplied, loupe writes a throwaway WHIP_HOME config declaring
  * the provider + model panel instead. `-max-turns` caps the tool loop as a
  * safety net in case the model ignores the headless directive.
+ *
+ * Binary resolution: the `whip` on PATH wins; if it is absent (e.g. the
+ * upstream v1.0.0 rename to `whipcode` removed it), loupe falls back to a
+ * pinned release download so harness "whip" keeps working with no user action.
  */
 export function whipHarness(): Harness {
   return {
     name: "whip",
     credentialKeys: [],
-    available: () => commandExists("whip"),
-    review: (ctx) => {
+    available: () => resolveWhipBinary(null).then((b) => b !== null),
+    review: async (ctx) => {
+      const binary = (await resolveWhipBinary(ctx.logger)) ?? "whip";
+      if (binary !== "whip") {
+        ctx.logger
+          .child("whip")
+          .info(
+            `no whip on PATH; using pinned ${PINNED_WHIP_TAG} from ${binary}`,
+          );
+      }
       // Agentic reviews need room to explore the checkout with tools; headless
       // diff-only reviews should answer in one turn, capped as a safety net.
       // The agentic cap is configurable (config.json maxTurns / --max-turns).
@@ -508,7 +613,7 @@ export function whipHarness(): Harness {
         ctx.systemPrompt,
       ];
       if (ctx.model) args.push("-m", ctx.model);
-      const whipEnv = ctx.whipConfig
+      const whipEnv: Record<string, string> = ctx.whipConfig
         ? materializeWhipHome(ctx.whipConfig, ctx.reasoning)
         : {};
       if (ctx.reasoning && !ctx.whipConfig) {
@@ -525,7 +630,7 @@ export function whipHarness(): Harness {
       const withKey = ctx.cacheKey
         ? [...args, "-cache-key", ctx.cacheKey]
         : args;
-      return runWhipStreaming(withKey, runCtx).catch((err: unknown) => {
+      return runWhipStreaming(withKey, runCtx, binary).catch((err: unknown) => {
         // A reviewer that opted out via promptCache:false has cacheKey
         // undefined, so this never fires for it — no wasted retry.
         if (shouldRetryWithoutCacheKey(err, ctx.cacheKey)) {
@@ -535,7 +640,7 @@ export function whipHarness(): Harness {
               "prompt cache key rejected; retrying without it. " +
                 "Set promptCache:false to skip this retry.",
             );
-          return runWhipStreaming(args, runCtx);
+          return runWhipStreaming(args, runCtx, binary);
         }
         throw err;
       });
