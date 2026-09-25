@@ -524,8 +524,15 @@ export function whipHarness(): Harness {
         ctx.systemPrompt,
       ];
       if (ctx.model) args.push("-m", ctx.model);
-      const whipEnv = ctx.whipConfig
-        ? materializeWhipHome(ctx.whipConfig, ctx.reasoning)
+      const whipEnv: Record<string, string> = ctx.whipConfig
+        ? (() => {
+            const env = materializeWhipHome(ctx.whipConfig, ctx.reasoning);
+            // whip v0.x reads WHIP_HOME/~/.whip; whipcode v1+ renamed both the
+            // binary and its env override (WHIPCODE_HOME/~/.whipcode). Point
+            // whichever generation is installed at the temp config dir.
+            const home = env.WHIP_HOME as string;
+            return binary === "whipcode" ? { WHIPCODE_HOME: home } : env;
+          })()
         : {};
       if (ctx.reasoning && !ctx.whipConfig) {
         ctx.logger
