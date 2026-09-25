@@ -129,8 +129,10 @@ export type ReviewRequest = {
   readonly full?: boolean;
   /**
    * Run the review with several models (on the harness) and keep only findings a
-   * majority agree on; minority findings are surfaced as lower-confidence.
-   * Supersedes the verification pass. Needs >= 2 models to take effect.
+   * majority agree on; minority findings are surfaced as lower-confidence. The
+   * verification pass still runs after the merge: majority agreement filters
+   * cross-model noise but not the outside-diff class (several models can agree
+   * on a claim the surrounding code refutes). Needs >= 2 models to take effect.
    */
   readonly ensembleModels?: readonly string[];
   /**
@@ -380,13 +382,14 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   // it actually exists on disk; fall back to the workdir (or cwd) so a run
   // without a local checkout — the whole diff is in the prompt — still spawns.
   const scoped = subdir ? join(req.workdir, subdir) : req.workdir;
-  const harnessCwd = existsSync(scoped)
+  const hasCheckout = existsSync(scoped);
+  const harnessCwd = hasCheckout
     ? scoped
     : existsSync(req.workdir)
       ? req.workdir
       : process.cwd();
 
-  if (agentic && !existsSync(scoped)) {
+  if (agentic && !hasCheckout) {
     logger.warn(
       "Agentic review has no matching checkout on disk; the agent can't inspect real files. Pass --workdir pointing at a checkout, or set agentic: false.",
       { scoped, fallbackCwd: harnessCwd },
@@ -612,13 +615,29 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     review = one.review;
     dropped = one.dropped;
     inline = one.inline;
-    // Verification pass: a cheap second opinion that drops false positives.
-    if (req.verify !== false && inline.length > 0) {
-      const v = await verifyInline(req, files, inline, harnessCwd);
-      verify = v.status;
-      verifyDropped = inline.length - v.kept.length;
-      inline = v.kept;
-    }
+  }
+
+  // Verification pass: a second opinion that drops false positives. Runs after
+  // both a single-model review and an ensemble merge — majority agreement
+  // filters cross-model noise but not the outside-diff class (several models
+  // can agree on a claim the surrounding code refutes), so the verifier still
+  // reads the checkout and marks `real: false` when it does. When the review
+  // was agentic and a real checkout exists, verify agentic too so the verifier
+  // can read the surrounding code that refutes (or confirms) each finding
+  // — instead of acquitting outside-diff claims it can't see.
+  if (req.verify !== false && inline.length > 0) {
+    const v = await verifyInline(
+      req,
+      files,
+      inline,
+      harnessCwd,
+      agentic,
+      hasCheckout,
+      subdir && harnessCwd === scoped ? subdir : undefined,
+    );
+    verify = v.status;
+    verifyDropped = inline.length - v.kept.length;
+    inline = v.kept;
   }
 
   if (dropped.length > 0) {
@@ -738,23 +757,29 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
   return { ...result, summaryBody, reviewedHeadSha: pull.headSha };
 }
 
-/**
- * Ask the harness to judge each finding real or not; drop the ones it rejects.
- * One-shot (never agentic). Fail-open: an error or an incomplete/invalid
- * verdict set keeps every finding and reports why.
- */
+/** Ask the harness to judge each finding real or not; drop the ones it rejects.
+ * Agentic when the review was agentic and a real checkout exists (reads the
+ * surrounding code to confirm or refute each finding); one-shot from the diff
+ * otherwise. Fail-open: an error or an incomplete/invalid verdict set keeps
+ * every finding and reports why. */
 async function verifyInline(
   req: ReviewRequest,
   files: readonly { path: string; patch: string | undefined }[],
   findings: readonly Finding[],
   harnessCwd: string,
+  agentic: boolean,
+  hasCheckout: boolean,
+  cwdSubdir?: string,
 ): Promise<{ kept: Finding[]; status: ReviewDiagnostics["verify"] }> {
+  const verifyAgentic = agentic && hasCheckout;
   try {
     const stdout = await req.harness.review({
-      systemPrompt: buildVerifySystemPrompt(),
-      userPrompt: buildVerifyUserPrompt(findings, files),
+      systemPrompt: buildVerifySystemPrompt({ agentic: verifyAgentic }),
+      userPrompt: buildVerifyUserPrompt(findings, files, {
+        cwdSubdir: verifyAgentic ? cwdSubdir : undefined,
+      }),
       model: req.model,
-      agentic: false,
+      agentic: verifyAgentic,
       workdir: harnessCwd,
       env: req.harnessEnv,
       whipConfig: req.whipConfig,
@@ -792,11 +817,13 @@ async function verifyInline(
       before: findings.length,
       after: kept.length,
       dropped: findings.length - kept.length,
+      agentic: verifyAgentic,
     });
     return { kept, status: "passed" };
   } catch (err) {
     req.logger.warn("Verification pass failed; keeping all findings", {
       error: err instanceof Error ? err.message : String(err),
+      agentic: verifyAgentic,
     });
     return { kept: [...findings], status: "failed" };
   }

@@ -272,9 +272,13 @@ function fakeHarness(script: {
  * EVERY call (agentic and the headless fallback alike) so produceOne's own
  * agentic→one-shot retry also fails and the throw propagates to the ensemble
  * loop — the shape of a real timeout/quota death. A string script answers that
- * model's agentic review; non-agentic calls (verify) return "".
+ * model's agentic review. The verify pass is detected by its system-prompt prefix
+ * and answered from the optional `verify` script (defaulting to "" → invalid).
  */
-function fakePerModelHarness(byModel: Record<string, string | Error>): {
+function fakePerModelHarness(
+  byModel: Record<string, string | Error>,
+  verify?: string,
+): {
   harness: Harness;
   contexts: HarnessContext[];
 } {
@@ -285,6 +289,19 @@ function fakePerModelHarness(byModel: Record<string, string | Error>): {
     available: async () => true,
     review: async (ctx) => {
       contexts.push(ctx);
+      const verifying = ctx.systemPrompt.startsWith(
+        "You are a strict reviewer verifying",
+      );
+      if (verifying) {
+        const output = verify ?? "";
+        ctx.trace?.({
+          type: "done",
+          text: output,
+          model: ctx.model,
+          phase: ctx.phase,
+        });
+        return output;
+      }
       const script = ctx.model ? byModel[ctx.model] : undefined;
       if (script instanceof Error) {
         ctx.trace?.({
@@ -384,8 +401,9 @@ describe("runReview end to end", () => {
     );
     expect(agenticCtx.systemPrompt).toContain("Procedure — do these before");
 
-    // The verify pass ran headless over the one in-scope finding.
-    expect(contexts[1]!.agentic).toBe(false);
+    // The verify pass ran agentic over the one in-scope finding — it has the
+    // same checkout the primary pass did, so it can read surrounding code.
+    expect(contexts[1]!.agentic).toBe(true);
     expect(contexts[1]!.userPrompt).toContain("#0 [warning] svc/b.ts:11");
     expect(contexts[1]!.userPrompt).not.toContain("A is wrong");
 
@@ -449,7 +467,9 @@ describe("runReview end to end", () => {
 
     const result = await runReview(request(api, harness, checkout()));
 
-    expect(contexts.map((c) => c.agentic)).toEqual([true, false, false]);
+    // [0] agentic primary, [1] headless fallback, [2] agentic verify (the
+    // checkout exists, so the verifier reads surrounding code too).
+    expect(contexts.map((c) => c.agentic)).toEqual([true, false, true]);
     expect(contexts[1]!.userPrompt).toContain("Diff under review:");
     expect(contexts[1]!.userPrompt).toContain(
       "+export async function selectThing",
@@ -518,7 +538,7 @@ describe("runReview end to end", () => {
     ).toEqual(expect.objectContaining({ error: "primary exploded" }));
   });
 
-  it("tags every ensemble model independently and skips verification", async () => {
+  it("tags every ensemble model independently (no findings → no verify)", async () => {
     const api = fakeOctokit({});
     const { harness } = fakeHarness({ agentic: reviewJson([]) });
     const events: HarnessTraceEvent[] = [];
@@ -536,6 +556,7 @@ describe("runReview end to end", () => {
       "ensemble:model-b:reasoning",
       "ensemble:model-b:done",
     ]);
+    // No findings survived the merge, so the verify pass has nothing to judge.
     expect(events.some((event) => event.phase?.startsWith("verify"))).toBe(
       false,
     );
@@ -546,15 +567,28 @@ describe("runReview end to end", () => {
     // it clears the 2-of-3 majority and posts inline; the run is flagged
     // degraded because a leg was lost.
     const api = fakeOctokit({});
-    const { harness, contexts } = fakePerModelHarness({
-      "model-a": reviewJson([
-        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
-      ]),
-      "model-b": reviewJson([
-        { path: "svc/a.ts", line: 2, severity: "warning", body: "A is wrong" },
-      ]),
-      "model-c": new Error("whip error: context deadline exceeded"),
-    });
+    const { harness, contexts } = fakePerModelHarness(
+      {
+        "model-a": reviewJson([
+          {
+            path: "svc/a.ts",
+            line: 2,
+            severity: "warning",
+            body: "A is wrong",
+          },
+        ]),
+        "model-b": reviewJson([
+          {
+            path: "svc/a.ts",
+            line: 2,
+            severity: "warning",
+            body: "A is wrong",
+          },
+        ]),
+        "model-c": new Error("whip error: context deadline exceeded"),
+      },
+      verifyAll(1),
+    );
     const events: HarnessTraceEvent[] = [];
 
     const result = await runReview(
@@ -568,22 +602,25 @@ describe("runReview end to end", () => {
     // pass and again on produceOne's headless fallback (a plain Error isn't a
     // non-retryable HarnessError, so the fallback fires and also dies) before the
     // ensemble loop caught it. Only the survivors' majority-confirmed finding
-    // posts inline.
+    // posts inline, and the verify pass still runs on it (an agentic review with
+    // a checkout keeps the verifier agentic).
     expect(events.map((e) => `${e.phase}:${e.type}`)).toEqual([
       "ensemble:model-a:done",
       "ensemble:model-b:done",
       "ensemble:model-c:error",
       "fallback:model-c:error",
+      "verify:done",
     ]);
     expect(result.inline.map((f) => `${f.path}:${f.line}`)).toEqual([
       "svc/a.ts:2",
     ]);
     expect(result.diagnostics.degradedLegs).toEqual(["model-c"]);
     expect(isDegraded(result.diagnostics)).toBe(true);
-    // Exactly four harness calls: one agentic per leg (3), plus produceOne's
+    // Exactly five harness calls: one agentic per leg (3), plus produceOne's
     // headless fallback for the dead leg (a plain Error isn't non-retryable, so
-    // the fallback fires and also dies). Ensembles skip the verify pass.
-    expect(contexts.length).toBe(4);
+    // the fallback fires and also dies), plus the agentic verify pass on the one
+    // majority-confirmed finding.
+    expect(contexts.length).toBe(5);
   });
 
   it("a lone surviving ensemble leg lands in lower-confidence, not inline-confirmed", async () => {
@@ -687,6 +724,68 @@ describe("runReview end to end", () => {
     ).rejects.toThrow("all ensemble models failed");
     // Nothing posted — the reviewer-level failure path handles visibility.
     expect(api.calls).toEqual([]);
+  });
+
+  it("ensemble + verify coexist: the verify pass drops a majority-confirmed false positive", async () => {
+    // sebi75 (#46): turning on an ensemble used to drop the verification pass
+    // entirely. Majority agreement filters cross-model noise but not the
+    // outside-diff class — both models can agree on a claim the surrounding
+    // code refutes. The verify pass now runs on the merged inline findings too.
+    const api = fakeOctokit({});
+    const { harness, contexts } = fakePerModelHarness(
+      {
+        "model-a": reviewJson([
+          {
+            path: "svc/a.ts",
+            line: 2,
+            severity: "warning",
+            body: "A is wrong",
+          },
+        ]),
+        "model-b": reviewJson([
+          {
+            path: "svc/a.ts",
+            line: 2,
+            severity: "warning",
+            body: "A is wrong",
+          },
+        ]),
+      },
+      // The verifier reads the checkout and refutes the majority-confirmed
+      // finding: real:false drops it, so nothing posts inline.
+      JSON.stringify({
+        verdicts: [
+          {
+            index: 0,
+            real: false,
+            reason: "early return makes this unreachable",
+          },
+        ],
+      }),
+    );
+    const events: HarnessTraceEvent[] = [];
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+        trace: (event) => events.push(event),
+      }),
+    );
+
+    // Both legs ran, then the verify pass ran over the one merged finding.
+    expect(events.map((e) => `${e.phase}:${e.type}`)).toEqual([
+      "ensemble:model-a:done",
+      "ensemble:model-b:done",
+      "verify:done",
+    ]);
+    // The majority-confirmed finding was rejected by verification.
+    expect(result.inline).toEqual([]);
+    expect(result.diagnostics.verify).toBe("passed");
+    expect(result.diagnostics.verifyDropped).toBe(1);
+    // Three harness calls: two agentic legs + one agentic verify.
+    expect(contexts.length).toBe(3);
+    expect(contexts[2]!.agentic).toBe(true);
+    expect(contexts[2]!.userPrompt).toContain("#0 [warning] svc/a.ts:2");
   });
 
   it("promptCache:true (default) stamps a stable cache key on every call", async () => {
