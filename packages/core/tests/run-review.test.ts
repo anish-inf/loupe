@@ -655,6 +655,72 @@ describe("runReview end to end", () => {
     expect(result.summaryBody).toContain("svc/a.ts:2");
   });
 
+  it("unions concerns, highlights, and off-diff notes across surviving ensemble legs (issue #40)", async () => {
+    // Two models both survive. Model A raises an off-diff finding (unusable line)
+    // and a highlight; model B raises the same off-diff finding reworded, plus a
+    // concern and a highlight A didn't have. Before #40's fix, only the first
+    // survivor's review body was kept — B's concern and the union of dropped
+    // notes were silently discarded.
+    const api = fakeOctokit({});
+    const fullReview = JSON.stringify({
+      summary: "reviewed",
+      findings: [
+        // In-scope file, unusable line (far past the 3-line hunk) → salvages
+        // into the off-diff notes.
+        {
+          path: "svc/a.ts",
+          line: 999,
+          severity: "warning",
+          body: "config value is read before initialization",
+        },
+      ],
+      concerns: [],
+      highlights: ["cleanup of the retry loop"],
+    });
+    const { harness } = fakePerModelHarness({
+      "model-a": fullReview,
+      "model-b": JSON.stringify({
+        summary: "reviewed",
+        findings: [
+          // Same off-diff claim reworded by B — unions to one note.
+          {
+            path: "svc/a.ts",
+            line: 999,
+            severity: "warning",
+            body: "config value is read before it is initialized here",
+          },
+        ],
+        concerns: [
+          {
+            title: "Retry budget is shared across request paths",
+            detail:
+              "The retry budget counter is global, so one hot path can starve the others.",
+            severity: "warning",
+          },
+        ],
+        highlights: [
+          "cleanup of the retry loop",
+          "nice test coverage on parse",
+        ],
+      }),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+      }),
+    );
+
+    // The off-diff notes union: both legs' notes survive the union, and the
+    // reworded duplicate collapses to one entry (was: only the first
+    // survivor's single note).
+    expect(result.diagnostics.offDiff).toBe(1);
+    // B's concern survives into the posted review even though A came first.
+    expect(result.summaryBody).toContain("Retry budget is shared");
+    // Highlights union: A's plus B's unique one, deduped overlap.
+    expect(result.summaryBody).toContain("nice test coverage on parse");
+  });
+
   it("a leg that dies on the headless fallback does not taint the survivors' mode", async () => {
     // Bugbot: a dead leg sets counts.mode = "fallback" before its headless
     // retry, then the retry throws too — leaving "fallback" on shared counts.

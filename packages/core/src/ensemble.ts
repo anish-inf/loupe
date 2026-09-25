@@ -1,4 +1,4 @@
-import type { Finding, Severity } from "./types";
+import type { Finding, Note, Severity } from "./types";
 
 const SEV_RANK: Record<Severity, number> = { blocker: 3, warning: 2, nit: 1 };
 
@@ -16,8 +16,9 @@ export function majority(n: number): number {
 
 /**
  * Merge the findings from several models into agreement clusters. Two findings
- * agree when they're on the same file within `proximity` (default 3) lines of
- * each other. A cluster confirmed by at least `threshold` distinct models is
+ * agree when they're on the same file within a small line window AND their
+ * bodies are textually similar (see {@link findingsAgree}). A cluster
+ * confirmed by at least `threshold` distinct models is
  * high-confidence; the rest are uncertain. The representative is the
  * highest-severity, most detailed finding in the cluster.
  *
@@ -100,12 +101,80 @@ export type DedupeResult = {
 };
 
 /**
- * Findings agree when they're on the same file within `proximity` lines of each
- * other (default 3, matching `mergeEnsemble`). Returns true when two findings
- * from different reviewers should be treated as the same claim.
+ * Similarity gate for body comparison: character-trigram Jaccard.
+ *
+ * Calibration (see the bodySimilarity tests in packages/core/tests/diff.test.ts):
+ * real cross-model agreements (same defect, rephrased) score >= 0.09 even for
+ * one-line bodies, while same-line findings describing *different* defects
+ * score <= ~0.13 with the observed worst case at 0.133 — the classes are close,
+ * so the threshold is deliberately inclusive (issue #40: a missed agreement
+ * only demotes a finding to the uncertain section, and verify + the profile
+ * severity filter still gate what gets posted; a false merge would post a
+ * confirmed wrong comment, but position agreement below this threshold is
+ * overwhelmingly unrelated same-line noise, which scores at the floor).
+ *
+ * Trigram sets are cheap to build but pair comparisons are quadratic, so cache
+ * them per body string. The cache lives for the process; bodies are short and
+ * bounded by the size of a review, so unbounded growth isn't a concern.
  */
-export function findingsAgree(a: Finding, b: Finding, proximity = 3): boolean {
-  return a.path === b.path && Math.abs(a.line - b.line) <= proximity;
+export const SIMILARITY_THRESHOLD = 0.1;
+
+const trigramCache = new Map<string, Set<string>>();
+
+function trigrams(s: string): Set<string> {
+  const cached = trigramCache.get(s);
+  if (cached) return cached;
+  const normalized = s.toLowerCase().replace(/\s+/g, " ").trim();
+  const set = new Set<string>();
+  for (let i = 0; i + 3 <= normalized.length; i++)
+    set.add(normalized.slice(i, i + 3));
+  trigramCache.set(s, set);
+  return set;
+}
+
+/**
+ * Character-trigram Jaccard similarity between two strings, 0–1. Robust to word
+ * order and punctuation for short review prose — the reason to use this over
+ * token Jaccard: "SQL injection, unsanitized input" vs "user input not
+ * parameterized, injection" still scores high.
+ */
+export function bodySimilarity(a: string, b: string): number {
+  const A = trigrams(a);
+  const B = trigrams(b);
+  if (A.size === 0 && B.size === 0) return 1; // both empty → treat as equal
+  if (A.size === 0 || B.size === 0) return 0; // one empty → nothing in common
+  let inter = 0;
+  for (const g of A) if (B.has(g)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
+/** Bodies too short for trigram Jaccard to be meaningful. */
+function isDegenerateBody(s: string): boolean {
+  return trigrams(s).size < 3;
+}
+
+/**
+ * Findings agree when they're on the same file within `proximity` lines of each
+ * other (default 5, matching `mergeEnsemble`) AND their bodies are similar.
+ * Position is the cheap pre-filter; only positional candidates pay the
+ * trigram comparison. We deliberately err on the side of leaving things in: a
+ * degenerate (one-liner) body falls back to position-only agreement within the
+ * tight 3-line window, and the threshold is low because a missed agreement
+ * costs a finding its confirmed status while a false merge costs one comment.
+ */
+export function findingsAgree(a: Finding, b: Finding, proximity = 5): boolean {
+  if (a.path !== b.path) return false;
+  const near = Math.abs(a.line - b.line);
+  // Degenerate (one-liner) bodies carry too few trigrams for a meaningful
+  // similarity score, so fall back to position-only agreement — but only
+  // within the tight 3-line window, so a tiny body can't merge with something
+  // anchored far away.
+  if (isDegenerateBody(a.body) || isDegenerateBody(b.body)) {
+    return near <= 3;
+  }
+  return (
+    near <= proximity && bodySimilarity(a.body, b.body) >= SIMILARITY_THRESHOLD
+  );
 }
 
 /**
@@ -113,7 +182,8 @@ export function findingsAgree(a: Finding, b: Finding, proximity = 3): boolean {
  * published, so the same reworded claim raised by two reviewers posts once.
  *
  * Two findings are the same claim when they're on the same file within
- * `proximity` lines of each other. The union is sorted by (path, line) and
+ * `proximity` lines of each other AND their bodies are textually similar
+ * (see {@link findingsAgree}). The union is sorted by (path, line) and
  * clustered in a single left-to-right pass: a finding joins the current cluster
  * only when it agrees with that cluster's **anchor** — its earliest member —
  * not with the previous finding. This prevents transitive chaining, where a
@@ -192,4 +262,30 @@ export function dedupeFindings(
       suppressed: slot.suppressed,
     };
   });
+}
+
+/**
+ * Union several models' off-diff notes, collapsing reworded copies of the
+ * same note. Notes have no reliable line anchor (a `line` may be missing
+ * entirely, or salvaged from a malformed finding), so agreement is decided
+ * solely on path + body similarity — no line term. Sorted by (path, body) for
+ * determinism, then clustered left-to-right against a fixed anchor, matching
+ * {@link dedupeFindings}'s approach.
+ */
+export function dedupeNotes(noteLists: readonly (readonly Note[])[]): Note[] {
+  const flat: Note[] = [];
+  for (const list of noteLists) flat.push(...list);
+  flat.sort((a, b) =>
+    a.path < b.path ? -1 : a.path > b.path ? 1 : a.body < b.body ? -1 : 1,
+  );
+  const out: Note[] = [];
+  for (const note of flat) {
+    const last = out[out.length - 1];
+    const agrees =
+      last !== undefined &&
+      last.path === note.path &&
+      bodySimilarity(last.body, note.body) >= SIMILARITY_THRESHOLD;
+    if (!agrees) out.push(note);
+  }
+  return out;
 }

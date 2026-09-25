@@ -4,7 +4,15 @@ import { commentableLines } from "../src/diff";
 import { buildVerifySystemPrompt } from "../src/prompt";
 import { parseReviewOutput, parseVerification } from "../src/parse";
 import { severitiesForProfile } from "../src/types";
-import { dedupeFindings, majority, mergeEnsemble } from "../src/ensemble";
+import {
+  bodySimilarity,
+  dedupeFindings,
+  dedupeNotes,
+  findingsAgree,
+  majority,
+  mergeEnsemble,
+  SIMILARITY_THRESHOLD,
+} from "../src/ensemble";
 import { validateFindings } from "../src/validate";
 
 const patch = [
@@ -258,6 +266,154 @@ describe("mergeEnsemble", () => {
     expect(majority(2)).toBe(2);
     expect(majority(3)).toBe(2);
     expect(majority(4)).toBe(3);
+  });
+});
+
+describe("bodySimilarity", () => {
+  it("scores rephrased agreements well above threshold, unrelated bodies at the floor", () => {
+    const rephrased = bodySimilarity(
+      "SQL injection: unsanitized user input flows directly into the query string",
+      "SQL injection risk: user input is concatenated into the SQL query without parameterization",
+    );
+    const reordered = bodySimilarity(
+      "Possible SQL injection via string concatenation; input is not escaped before query execution",
+      "Injection vulnerability: query built by concatenating unescaped user input",
+    );
+    // Calibration anchors: agreements go to the confirmed side of the
+    // threshold, same-line different bugs to the floor.
+    expect(reordered).toBeGreaterThan(SIMILARITY_THRESHOLD);
+    expect(rephrased).toBeGreaterThan(SIMILARITY_THRESHOLD);
+    const unrelated = bodySimilarity(
+      "Off-by-one error in the loop bound causes the last element to be skipped",
+      "The file handle is never closed, leaking a descriptor on every iteration",
+    );
+    expect(unrelated).toBeLessThan(SIMILARITY_THRESHOLD);
+  });
+  it("handles empty bodies", () => {
+    expect(bodySimilarity("", "")).toBe(1);
+    expect(bodySimilarity("", "type error here")).toBe(0);
+  });
+});
+
+describe("findingsAgree", () => {
+  const f = (path: string, line: number, body: string) => ({
+    path,
+    line,
+    severity: "warning" as const,
+    body,
+  });
+  it("matches the same bug rephrased across nearby lines (issue #40 regression)", () => {
+    expect(
+      findingsAgree(
+        f(
+          "auth.ts",
+          42,
+          "SQL injection: unsanitized user input flows into the query",
+        ),
+        f(
+          "auth.ts",
+          38,
+          "SQL injection risk: input concatenated into the query unparameterized",
+        ),
+      ),
+    ).toBe(true);
+  });
+  it("splits unrelated findings on the same line (issue #40 false-merge regression)", () => {
+    expect(
+      findingsAgree(
+        f(
+          "utils.ts",
+          100,
+          "Off-by-one error in the loop bound; last element skipped",
+        ),
+        f(
+          "utils.ts",
+          100,
+          "The file handle is never closed, leaking a descriptor",
+        ),
+      ),
+    ).toBe(false);
+  });
+  it("respects a smaller explicit proximity window", () => {
+    const a = f(
+      "a.ts",
+      10,
+      "Off-by-one: the loop upper bound should be items.length - 1",
+    );
+    const b = f(
+      "a.ts",
+      15,
+      "Off-by-one in the loop: bound exceeds the last index of items",
+    );
+    // Same bug 5 lines apart: agrees with the default window (5), not with a
+    // caller-supplied window of 3.
+    expect(findingsAgree(a, b, 5)).toBe(true);
+    expect(findingsAgree(a, b, 3)).toBe(false);
+  });
+  it("matches the default window's reach but not beyond it (issue #40)", () => {
+    const a = f(
+      "a.ts",
+      10,
+      "Missing null check on the parsed value before property access",
+    );
+    const close = f(
+      "a.ts",
+      14,
+      "Parsed value used without a null check; may be undefined",
+    );
+    const far = f(
+      "a.ts",
+      16,
+      "Null check missing on the parsed value before property access",
+    );
+    expect(findingsAgree(a, close)).toBe(true); // delta 4, within default 5
+    expect(findingsAgree(a, far)).toBe(false); // delta 6, beyond default 5
+  });
+  it("falls back to position-only for degenerate bodies, but only within 3 lines", () => {
+    // Tiny bodies carry < 3 trigrams: no meaningful similarity signal.
+    const echoed = f("x.ts", 10, "Bug here");
+    const echoFar = f("x.ts", 30, "?");
+    expect(findingsAgree(echoed, f("x.ts", 12, "?"))).toBe(true);
+    expect(findingsAgree(echoed, echoFar)).toBe(false);
+  });
+  it("rejects different files regardless of similarity", () => {
+    expect(
+      findingsAgree(
+        f("a.ts", 10, "identical body"),
+        f("b.ts", 10, "identical body"),
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("dedupeNotes", () => {
+  const n = (path: string, body: string, line?: number) => ({
+    path,
+    severity: "warning" as const,
+    body,
+    ...(line !== undefined ? { line } : {}),
+  });
+  it("unions across models, collapsing reworded duplicates", () => {
+    const merged = dedupeNotes([
+      [n("cfg.ts", "config value read before initialization")],
+      [],
+      [
+        n("cfg.ts", "config read happens before the value is initialized"),
+        n("api.ts", "retry loop has no backoff"),
+      ],
+    ]);
+    expect(merged).toHaveLength(2);
+    expect(merged.map((m) => m.path).sort()).toEqual(["api.ts", "cfg.ts"]);
+    expect(
+      merged.some((m) => m.path === "api.ts" && m.body.includes("retry")),
+    ).toBe(true);
+  });
+  it("keeps notes whose line differs or is absent — line is not part of agreement", () => {
+    const merged = dedupeNotes([
+      [n("svc.ts", "identical off-diff note", 7)],
+      [n("svc.ts", "identical off-diff note")],
+    ]);
+    expect(merged).toHaveLength(1); // path + body agree → one note
   });
 });
 
