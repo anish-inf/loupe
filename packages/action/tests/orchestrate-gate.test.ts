@@ -45,10 +45,59 @@ vi.mock("@loupe/core", () => ({
       return { open: false, reason: "closed" as const };
     return { open: true };
   },
+  // Mirror checkPublishable: same pullsGet, same merged/closed/head-moved order.
+  checkPublishable: async () => {
+    const pr = await pullsGet();
+    if (pr.data.merged)
+      return { publishable: false, reason: "merged" as const };
+    if (pr.data.state === "closed")
+      return { publishable: false, reason: "closed" as const };
+    if (pr.data.head.sha !== "h".repeat(40))
+      return { publishable: false, reason: "head-moved" as const };
+    return { publishable: true };
+  },
+  dedupeFindings: vi.fn(
+    (perReviewer: readonly { reviewer: string; findings: unknown[] }[]) =>
+      perReviewer.map((r) => ({
+        reviewer: r.reviewer,
+        inline: r.findings,
+        suppressed: 0,
+      })),
+  ),
   upsertCombinedSummary,
   postIssueComment,
 }));
 
+const diagnostics = {
+  mode: "agentic" as const,
+  verify: "skipped" as const,
+  incremental: "full" as const,
+  malformedDropped: { findings: 0, concerns: 0 },
+  outOfScopeDropped: 0,
+  profileDropped: 0,
+  verifyDropped: 0,
+  offDiff: 0,
+  salvagedFindings: 0,
+  crossReviewerDropped: 0,
+  degradedLegs: [] as string[],
+};
+const produced = {
+  reviewerName: "default",
+  review: {
+    summary: "Looks fine.",
+    findings: [],
+    concerns: [],
+    highlights: [],
+  },
+  inline: [],
+  uncertain: [],
+  dropped: [],
+  diagnostics,
+  headSha: "h".repeat(40),
+  refreshPaths: new Set<string>(),
+  headPaths: new Set<string>(),
+  fileCount: 0,
+};
 const result: ReviewResult = {
   inlineCount: 0,
   droppedCount: 0,
@@ -56,21 +105,12 @@ const result: ReviewResult = {
   summary: "Looks fine.",
   inline: [],
   dropped: [],
-  diagnostics: {
-    mode: "agentic",
-    verify: "skipped",
-    incremental: "full",
-    malformedDropped: { findings: 0, concerns: 0 },
-    outOfScopeDropped: 0,
-    profileDropped: 0,
-    verifyDropped: 0,
-    offDiff: 0,
-    salvagedFindings: 0,
-    degradedLegs: [],
-  },
+  diagnostics,
 };
 vi.mock("../src/run", () => ({
-  reviewPullRequest: vi.fn(async () => result),
+  produceReviewPullRequest: vi.fn(async () => produced),
+  publishReviewPullRequest: vi.fn(async () => "summary body"),
+  resultFromProduced: () => result,
   formatResult: () => "loupe: 0 inline comment(s)",
 }));
 

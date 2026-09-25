@@ -121,6 +121,7 @@ function eventConfig(body: string): Config {
     ensembleModels: [],
     skills: [],
     timezone: "UTC",
+    crossReviewerDedup: true,
     eventPath: path,
     eventName: "issue_comment",
   } as Config;

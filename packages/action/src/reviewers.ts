@@ -83,6 +83,8 @@ const configSchema = z.object({
   maxTurns: z.number().int().positive().optional(),
   priorComments: z.enum(["resolve", "delete", "keep"]).optional(),
   procedure: z.boolean().optional(),
+  /** false = let the same finding post from multiple reviewers (no dedup). */
+  crossReviewerDedup: z.boolean().optional(),
   promptCache: z.boolean().optional(),
   whip: whipConfigSchema.optional(),
 });
@@ -99,6 +101,7 @@ export type LoupeSettings = {
   readonly maxTurns?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
+  readonly crossReviewerDedup?: boolean;
   readonly promptCache?: boolean;
   readonly whip?: z.infer<typeof whipConfigSchema>;
 };
@@ -117,6 +120,7 @@ export function loadSettings(configPath: string): LoupeSettings {
     maxTurns: c.maxTurns,
     priorComments: c.priorComments,
     procedure: c.procedure,
+    crossReviewerDedup: c.crossReviewerDedup,
     promptCache: c.promptCache,
     whip: c.whip,
   };
