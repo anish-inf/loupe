@@ -68,7 +68,7 @@ function outcomeLine(o: ReviewerOutcome): string {
     return `${o.name}: no changed files in scope`;
   }
   const n = (s: "blocker" | "warning" | "nit"): number =>
-    r.inline.filter((f) => f.severity === s).length;
+    [...r.inline, ...r.overflow].filter((f) => f.severity === s).length;
   const bits = [
     n("blocker") ? `🔴 ${n("blocker")}` : "",
     n("warning") ? `🟡 ${n("warning")}` : "",

@@ -685,8 +685,9 @@ function statLine(
   review: ReviewOutput,
   fileCount: number,
   degraded: boolean,
+  overflow: readonly Finding[] = [],
 ): string {
-  const all = [...inline, ...review.concerns];
+  const all = [...inline, ...overflow, ...review.concerns];
   const n = (s: Finding["severity"]): number =>
     all.filter((f) => f.severity === s).length;
   const bits: string[] = [];
@@ -822,6 +823,8 @@ export type PostReviewOptions = {
   readonly headPaths?: ReadonlySet<string>;
   /** Files in scope, for the stat line. */
   readonly fileCount: number;
+  /** Findings demoted by the comment cap: counted in tallies, listed collapsed. */
+  readonly overflow?: readonly Finding[];
   /** What to do with prior inline comments (default resolve). */
   readonly priorComments?: PriorComments;
   /** Run diagnostics for the summary; omitted = not rendered. */
@@ -1039,7 +1042,13 @@ export async function postReview(
   const shortSha = opts.headSha.slice(0, 7);
   const lastReviewed = `Last reviewed commit: [\`${shortSha}\`](https://github.com/${ref.owner}/${ref.repo}/commit/${opts.headSha})`;
   const degraded = opts.diagnostics ? isDegraded(opts.diagnostics) : false;
-  const stats = statLine(inline, review, opts.fileCount, degraded);
+  const stats = statLine(
+    inline,
+    review,
+    opts.fileCount,
+    degraded,
+    opts.overflow,
+  );
   const summaryBody = renderReviewBody(
     title,
     stats,

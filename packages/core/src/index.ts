@@ -184,6 +184,8 @@ export type ReviewResult = {
   readonly requestedChanges: boolean;
   readonly summary: string;
   readonly inline: readonly Finding[];
+  /** Findings ranked out by the comment cap; listed collapsed in the summary. */
+  readonly overflow: readonly Finding[];
   readonly dropped: readonly Note[];
   readonly diagnostics: ReviewDiagnostics;
   /** Rich per-reviewer Markdown used by the action's combined summary. */
@@ -247,6 +249,25 @@ export type ProducedReview = {
 };
 
 /**
+ * Apply the inline comment cap at result/publish time — after verification,
+ * ensemble merge, and cross-reviewer dedupe have finalized the finding set —
+ * so unique findings are only demoted once duplicates have had their chance
+ * to vacate slots. Ranks by severity (blocker > warning > nit); ties keep
+ * the incoming order. Findings beyond the cap are the `overflow`, listed
+ * collapsed in the summary and still counted by the verdict and tallies.
+ */
+export function applyCommentCap(
+  inline: readonly Finding[],
+  cap: number,
+): { inline: readonly Finding[]; overflow: readonly Finding[] } {
+  if (inline.length <= cap) return { inline, overflow: [] };
+  const ranked = [...inline].sort(
+    (a, b) => severityRank(a.severity) - severityRank(b.severity),
+  );
+  return { inline: ranked.slice(0, cap), overflow: ranked.slice(cap) };
+}
+
+/**
  * Build a {@link ReviewResult} from a produced review, optionally overriding
  * the inline findings and diagnostics (after cross-reviewer dedupe). The
  * requested-changes verdict is recomputed from the (possibly deduped) inline
@@ -264,23 +285,29 @@ export function reviewResultFromProduced(
       requestedChanges: false,
       summary: produced.empty.summary,
       inline: [],
+      overflow: [],
       dropped: [],
       diagnostics,
     };
   }
+  const capped = applyCommentCap(
+    inline,
+    produced.commentCap ?? DEFAULT_MAX_COMMENTS,
+  );
   const requestedChanges = [
-    ...inline,
-    ...produced.overflow,
+    ...capped.inline,
+    ...capped.overflow,
     ...produced.review.concerns,
   ].some((f) => f.severity === "blocker");
   return {
-    inlineCount: inline.length,
+    inlineCount: capped.inline.length,
     droppedCount: produced.dropped.length,
     requestedChanges,
     summary: produced.review.summary,
-    inline,
+    inline: capped.inline,
+    overflow: capped.overflow,
     dropped: produced.dropped,
-    diagnostics,
+    diagnostics: { ...diagnostics, cappedDropped: capped.overflow.length },
   };
 }
 
@@ -309,13 +336,21 @@ export async function publishReview(
   logger: Logger,
   opts?: PublishOptions,
 ): Promise<string> {
-  const inline = opts?.inline ?? produced.inline;
+  // Apply the comment cap here, on the deduped set, so what posts inline,
+  // what renders as the summary's overflow section, and what the caller's
+  // ReviewResult reports are consistent — and unique findings are only demoted
+  // after cross-reviewer dedupe has had its chance to free slots.
+  const uncapped = opts?.inline ?? produced.inline;
+  const { inline, overflow } = applyCommentCap(
+    uncapped,
+    produced.commentCap ?? DEFAULT_MAX_COMMENTS,
+  );
   const diagnostics = opts?.diagnostics ?? produced.diagnostics;
   const reviewForPost = reviewForPosting(
     produced.review,
     produced.uncertain,
-    produced.overflow,
-    produced.commentCap,
+    overflow,
+    produced.commentCap ?? DEFAULT_MAX_COMMENTS,
   );
   return postReview(
     octokit,
@@ -330,6 +365,7 @@ export async function publishReview(
       refreshPaths: produced.refreshPaths,
       headPaths: produced.headPaths,
       fileCount: produced.fileCount,
+      overflow,
       priorComments: opts?.priorComments,
       diagnostics,
       deferSummary: opts?.deferSummary,
@@ -819,22 +855,6 @@ export async function produceReview(
     });
   }
 
-  // Comment cap: rank by severity (blocker > warning > nit) so the most
-  // important findings are the inline ones; the rest go to the summary.
-  const maxComments = req.maxComments ?? DEFAULT_MAX_COMMENTS;
-  let overflow: Finding[] = [];
-  if (inline.length > maxComments) {
-    const ranked = [...inline].sort(
-      (a, b) => severityRank(a.severity) - severityRank(b.severity),
-    );
-    inline = ranked.slice(0, maxComments);
-    overflow = ranked.slice(maxComments);
-    logger.info("Capped inline comments", {
-      kept: inline.length,
-      demoted: overflow.length,
-    });
-  }
-
   const diagnostics: ReviewDiagnostics = {
     mode: counts.mode,
     verify,
@@ -848,7 +868,7 @@ export async function produceReview(
     verifyDropped,
     crossReviewerDropped: 0,
     offDiff: dropped.length,
-    cappedDropped: overflow.length,
+    cappedDropped: 0,
     salvagedFindings: counts.salvagedFindings,
     degradedLegs: failedLegs,
   };
@@ -858,8 +878,8 @@ export async function produceReview(
     review,
     inline,
     uncertain,
-    overflow,
-    commentCap: maxComments,
+    overflow: [],
+    commentCap: req.maxComments ?? DEFAULT_MAX_COMMENTS,
     dropped,
     diagnostics,
     headSha: pull.headSha,

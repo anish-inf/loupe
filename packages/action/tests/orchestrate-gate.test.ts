@@ -106,6 +106,7 @@ const result: ReviewResult = {
   requestedChanges: false,
   summary: "Looks fine.",
   inline: [],
+  overflow: [],
   dropped: [],
   diagnostics,
 };

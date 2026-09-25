@@ -269,6 +269,7 @@ const clean = (name: string): OkOutcome => ({
     requestedChanges: false,
     summary: "Looks fine.",
     inline: [],
+    overflow: [],
     dropped: [],
     diagnostics,
   },

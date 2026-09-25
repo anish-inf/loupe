@@ -368,7 +368,7 @@ const verifyAll = (n: number) =>
 /** A minimal non-empty ProducedReview for unit-testing result assembly. */
 const producedWith = (
   inline: readonly Finding[],
-  overflow: readonly Finding[],
+  commentCap = 10,
   concerns: readonly Finding[] = [],
 ): ProducedReview => ({
   reviewerName: "code",
@@ -380,7 +380,10 @@ const producedWith = (
   },
   inline,
   uncertain: [],
-  overflow,
+  // The produce phase emits no overflow; the cap applies at result/publish
+  // time over the (possibly deduped) inline set.
+  overflow: [],
+  commentCap,
   dropped: [],
   diagnostics: {} as ReviewDiagnostics,
   headSha: "d".repeat(40),
@@ -403,34 +406,41 @@ describe("reviewResultFromProduced: cap × dedup verdict", () => {
     body: "w",
   };
 
-  it("a blocker demoted to overflow still requests changes", () => {
-    const produced = producedWith([warning], [blocker]);
-    const r = reviewResultFromProduced(produced, [], produced.diagnostics);
+  it("a blocker demoted by the cap still requests changes", () => {
+    // Two blockers at a cap of one: one posts inline, one overflows, and the
+    // verdict must reflect the whole run, not just what posted.
+    const produced = producedWith([blocker, { ...blocker, line: 3 }], 1);
+    const r = reviewResultFromProduced(produced);
+    expect(r.inlineCount).toBe(1);
+    expect(r.overflow).toHaveLength(1);
     expect(r.requestedChanges).toBe(true);
+    expect(r.diagnostics.cappedDropped).toBe(1);
   });
 
   it("a blocker removed by the dedup override no longer requests changes", () => {
     // Upstream's contract: the verdict is recomputed from the deduped inline
-    // set, so a blocker that was a duplicate doesn't request changes — and the
-    // cap must not resurrect it: overflow never contained it.
-    const produced = producedWith([blocker], [warning]);
+    // set, so a blocker that was a duplicate doesn't request changes.
+    const produced = producedWith([blocker, warning]);
     const original = reviewResultFromProduced(produced);
     expect(original.requestedChanges).toBe(true);
     const deduped = reviewResultFromProduced(produced, []);
     expect(deduped.requestedChanges).toBe(false);
   });
 
-  it("dedup removing the inline blocker keeps the verdict if it also survives in overflow", () => {
-    // The same logical blocker was demoted by the cap AND the deduped inline
-    // set lost its copy: overflow still holds a blocker, so verdict stays.
-    const produced = producedWith([blocker], [blocker]);
-    const r = reviewResultFromProduced(produced, [], produced.diagnostics);
-    expect(r.requestedChanges).toBe(true);
+  it("the cap never resurrects a blocker that dedup removed", () => {
+    // Dedup leaves only a warning; capping that set cannot put the removed
+    // blocker back — inline or overflow — so the verdict stays off.
+    const produced = producedWith([blocker, warning], 1);
+    const deduped = reviewResultFromProduced(produced, [warning]);
+    expect(deduped.requestedChanges).toBe(false);
+    expect(deduped.overflow).toHaveLength(0);
   });
 
   it("no requirements when neither inline nor overflow holds a blocker", () => {
-    const produced = producedWith([warning], [warning]);
-    const r = reviewResultFromProduced(produced, [], produced.diagnostics);
+    const produced = producedWith([warning, { ...warning, line: 3 }], 1);
+    const r = reviewResultFromProduced(produced);
+    expect(r.inlineCount).toBe(1);
+    expect(r.overflow).toHaveLength(1);
     expect(r.requestedChanges).toBe(false);
   });
 });
@@ -643,6 +653,32 @@ describe("comment cap", () => {
       "Additional findings (ranked below the 1-comment cap)",
     );
     expect(body).toContain("`svc/a.ts:2` [nit] nit");
+  });
+
+  it("tallies demoted findings in the summary header, not only the inline review", async () => {
+    const api = fakeOctokit({});
+    const findings = [
+      ...Array.from({ length: 6 }, (_, i) => ({
+        path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+        line: i % 2 === 0 ? 2 : 11,
+        severity: "nit",
+        body: `nit ${i}`,
+      })),
+    ];
+    const { harness } = fakeHarness({ agentic: reviewJson(findings) });
+    await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 2,
+        verify: false,
+        profile: "assertive",
+      }),
+    );
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as { body: string }
+    ).body;
+    // The stat line must count all six findings, not just the two that
+    // posted inline (Bugbot: capped findings were omitted from tallies).
+    expect(body).toContain("🔵 6");
   });
 
   it("deferSummary: the overflow section lands in the returned summaryBody for the orchestrator", async () => {
