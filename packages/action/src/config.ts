@@ -80,7 +80,7 @@ function asMaxTurns(v: string | undefined): number | undefined {
   return n;
 }
 
-function asMaxComments(v: string | undefined): number | undefined {
+export function asMaxComments(v: string | undefined): number | undefined {
   if (v === undefined) return undefined;
   const n = Number(v);
   if (!Number.isInteger(n) || n <= 0) {

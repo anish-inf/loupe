@@ -13,9 +13,17 @@ import type {
   HarnessContext,
   HarnessTraceEvent,
 } from "@loupe/harness";
+import type { Finding } from "../src/types";
 import { describe, expect, it, vi } from "vitest";
 
-import { isDegraded, runReview, type ReviewRequest } from "../src/index";
+import {
+  isDegraded,
+  reviewResultFromProduced,
+  runReview,
+  type ProducedReview,
+  type ReviewDiagnostics,
+  type ReviewRequest,
+} from "../src/index";
 
 const ref = { owner: "acme", repo: "app", pull_number: 7 };
 const SHA_A = "a".repeat(40);
@@ -357,6 +365,76 @@ const verifyAll = (n: number) =>
     verdicts: Array.from({ length: n }, (_, i) => ({ index: i, real: true })),
   });
 
+/** A minimal non-empty ProducedReview for unit-testing result assembly. */
+const producedWith = (
+  inline: readonly Finding[],
+  overflow: readonly Finding[],
+  concerns: readonly Finding[] = [],
+): ProducedReview => ({
+  reviewerName: "code",
+  review: {
+    summary: "s",
+    findings: [],
+    concerns: concerns as never,
+    highlights: [],
+  },
+  inline,
+  uncertain: [],
+  overflow,
+  dropped: [],
+  diagnostics: {} as ReviewDiagnostics,
+  headSha: "d".repeat(40),
+  refreshPaths: new Set<string>(),
+  headPaths: new Set<string>(),
+  fileCount: 1,
+});
+
+describe("reviewResultFromProduced: cap × dedup verdict", () => {
+  const blocker: Finding = {
+    path: "a.ts",
+    line: 1,
+    severity: "blocker",
+    body: "b",
+  };
+  const warning: Finding = {
+    path: "a.ts",
+    line: 2,
+    severity: "warning",
+    body: "w",
+  };
+
+  it("a blocker demoted to overflow still requests changes", () => {
+    const produced = producedWith([warning], [blocker]);
+    const r = reviewResultFromProduced(produced, [], produced.diagnostics);
+    expect(r.requestedChanges).toBe(true);
+  });
+
+  it("a blocker removed by the dedup override no longer requests changes", () => {
+    // Upstream's contract: the verdict is recomputed from the deduped inline
+    // set, so a blocker that was a duplicate doesn't request changes — and the
+    // cap must not resurrect it: overflow never contained it.
+    const produced = producedWith([blocker], [warning]);
+    const original = reviewResultFromProduced(produced);
+    expect(original.requestedChanges).toBe(true);
+    const deduped = reviewResultFromProduced(produced, []);
+    expect(deduped.requestedChanges).toBe(false);
+  });
+
+  it("dedup removing the inline blocker keeps the verdict if it also survives in overflow", () => {
+    // The same logical blocker was demoted by the cap AND the deduped inline
+    // set lost its copy: overflow still holds a blocker, so verdict stays.
+    const produced = producedWith([blocker], [blocker]);
+    const r = reviewResultFromProduced(produced, [], produced.diagnostics);
+    expect(r.requestedChanges).toBe(true);
+  });
+
+  it("no requirements when neither inline nor overflow holds a blocker", () => {
+    const produced = producedWith([warning], [warning]);
+    const r = reviewResultFromProduced(produced, [], produced.diagnostics);
+    expect(r.requestedChanges).toBe(false);
+  });
+});
+
 describe("comment cap", () => {
   // 12 findings: emit nits first, blockers last, to prove ranking, not
   // emission order, decides what stays inline.
@@ -464,6 +542,132 @@ describe("comment cap", () => {
       }
     ).body;
     expect(body).not.toContain("Additional findings");
+  });
+
+  it("exactly at the cap: everything posts inline, no overflow section", async () => {
+    const api = fakeOctokit({});
+    const five = Array.from({ length: 5 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "warning",
+      body: `w${i}`,
+    }));
+    const { harness } = fakeHarness({ agentic: reviewJson(five) });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+      }),
+    );
+
+    // Boundary must be inclusive: five findings at a cap of five post as-is.
+    expect(result.inlineCount).toBe(5);
+    expect(result.diagnostics.cappedDropped).toBe(0);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).not.toContain("Additional findings");
+  });
+
+  it("caps after the verification pass: findings rejected by verify never reach the cap", async () => {
+    const api = fakeOctokit({});
+    const six = Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "warning",
+      body: `w${i}`,
+    }));
+    const { harness } = fakeHarness({
+      agentic: reviewJson(six),
+      // Verify keeps only findings #0 and #2; the other four are rejected.
+      verify: JSON.stringify({
+        verdicts: six.map((_, i) => ({ index: i, real: i === 0 || i === 2 })),
+      }),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+      }),
+    );
+
+    // If the cap ran before verify, six findings would first be demoted to
+    // five and one would spill; running after verify, two survive and the
+    // cap never engages.
+    expect(result.diagnostics.verify).toBe("passed");
+    expect(result.diagnostics.verifyDropped).toBe(4);
+    expect(result.inlineCount).toBe(2);
+    expect(result.diagnostics.cappedDropped).toBe(0);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).not.toContain("Additional findings");
+  });
+
+  it("caps ensemble-merged findings: severity ranks a blocker over a demoted nit", async () => {
+    const api = fakeOctokit({});
+    // Both models emit the same two findings (one per diff anchor), so the
+    // majority merge confirms both. The nit is emitted first to prove the
+    // cap ranks by severity on the *merged* result, not emission order.
+    const merged = [
+      { path: "svc/a.ts", line: 2, severity: "nit", body: "nit" },
+      { path: "svc/b.ts", line: 11, severity: "blocker", body: "blocker" },
+    ];
+    const script = reviewJson(merged);
+    const { harness } = fakePerModelHarness({
+      "model-a": script,
+      "model-b": script,
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+        maxComments: 1,
+        profile: "assertive",
+      }),
+    );
+
+    // Ensemble merge confirmed exactly the two findings the models agreed on.
+    expect(result.inlineCount).toBe(1);
+    expect(result.inline[0]!.severity).toBe("blocker");
+    expect(result.diagnostics.cappedDropped).toBe(1);
+    expect(result.requestedChanges).toBe(true);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).toContain(
+      "Additional findings (ranked below the 1-comment cap)",
+    );
+    expect(body).toContain("`svc/a.ts:2` [nit] nit");
+  });
+
+  it("deferSummary: the overflow section lands in the returned summaryBody for the orchestrator", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: reviewJson(manyFindings),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 4,
+        verify: false,
+        profile: "assertive",
+        deferSummary: true,
+      }),
+    );
+
+    expect(result.inlineCount).toBe(4);
+    expect(result.diagnostics.cappedDropped).toBe(8);
+    // The orchestrator (not runReview) posts the combined summary, so the
+    // overflow note must travel on summaryBody.
+    expect(result.summaryBody).toContain(
+      "Additional findings (ranked below the 4-comment cap)",
+    );
+    // Nothing was posted as an issue comment; only the inline review exists.
+    expect(api.issues.createComment).not.toHaveBeenCalled();
   });
 });
 
