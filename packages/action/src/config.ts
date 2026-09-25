@@ -58,6 +58,7 @@ const envSchema = z.object({
   LOUPE_SKILLS: z.string().default(""),
   LOUPE_TIMEZONE: optionalInput,
   LOUPE_MAX_TURNS: optionalInput,
+  LOUPE_MAX_COMMENTS: optionalInput,
   LOUPE_PRIOR_COMMENTS: optionalInput,
   LOUPE_CROSS_REVIEWER_DEDUP: z
     .enum(["true", "false"])
@@ -75,6 +76,15 @@ function asMaxTurns(v: string | undefined): number | undefined {
   const n = Number(v);
   if (!Number.isInteger(n) || n <= 0) {
     throw new Error(`Invalid max-turns "${v}". Use a positive integer.`);
+  }
+  return n;
+}
+
+export function asMaxComments(v: string | undefined): number | undefined {
+  if (v === undefined) return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`Invalid max-comments "${v}". Use a positive integer.`);
   }
   return n;
 }
@@ -130,6 +140,7 @@ export type Config = {
   readonly timezone: string;
   readonly whipConfig?: WhipConfig;
   readonly maxTurns?: number;
+  readonly maxComments?: number;
   /** Explicit input/file value only; core defaults to "resolve". */
   readonly priorComments?: PriorComments;
   /** File value only; core defaults to true. */
@@ -187,6 +198,7 @@ export function loadConfig(): Config {
       .filter(Boolean),
     timezone: env.LOUPE_TIMEZONE ?? file.timezone ?? "UTC",
     maxTurns: asMaxTurns(env.LOUPE_MAX_TURNS) ?? file.maxTurns,
+    maxComments: asMaxComments(env.LOUPE_MAX_COMMENTS) ?? file.maxComments,
     priorComments:
       asPriorComments(env.LOUPE_PRIOR_COMMENTS) ?? file.priorComments,
     procedure: file.procedure,

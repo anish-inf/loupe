@@ -152,13 +152,6 @@ export function renderCombinedSummary(
   ].join("\n\n---\n\n");
 }
 
-/**
- * Run the configured review(s) for a PR — either the reviewer profiles from
- * `.loupe.json`, or a single default review. Shared by the pull_request entry
- * (main) and the `@loupe review` chat command. `overrideFull` forces a whole-PR
- * review regardless of config. Reviewer failures are reported on the PR here
- * and returned as outcomes. Only setup errors (bad config) reject.
- */
 export async function runReviews(
   config: Config,
   logger: Logger,
@@ -183,6 +176,7 @@ export async function runReviews(
     verify: config.verify,
     whipConfig: config.whipConfig,
     maxTurns: config.maxTurns,
+    maxComments: config.maxComments,
     full,
   };
 
@@ -218,6 +212,7 @@ export async function runReviews(
           skills: [...new Set([...(r.skills ?? []), ...config.skills])],
           timezone: config.timezone,
           maxTurns: r.maxTurns ?? config.maxTurns,
+          maxComments: r.maxComments ?? config.maxComments,
           priorComments: r.priorComments ?? config.priorComments,
           procedure: r.procedure ?? config.procedure,
           promptCache: r.promptCache ?? config.promptCache,
@@ -240,6 +235,7 @@ export async function runReviews(
           : undefined,
         skills: config.skills.length ? config.skills : undefined,
         timezone: config.timezone,
+        maxComments: config.maxComments,
         priorComments: config.priorComments,
         procedure: config.procedure,
         promptCache: config.promptCache,

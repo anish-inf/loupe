@@ -18,6 +18,7 @@ const diagnostics = {
   verifyDropped: 0,
   crossReviewerDropped: 0,
   offDiff: 0,
+  cappedDropped: 0,
   salvagedFindings: 0,
   degradedLegs: [],
 };
@@ -31,6 +32,7 @@ const clean = (name: string): OkOutcome => ({
     requestedChanges: false,
     summary: "Looks fine.",
     inline: [],
+    overflow: [],
     dropped: [],
     diagnostics,
   },
