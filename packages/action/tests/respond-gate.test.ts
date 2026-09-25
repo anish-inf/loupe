@@ -30,6 +30,7 @@ const {
     requestedChanges: false,
     summary: "ok",
     inline: [],
+    overflow: [],
     dropped: [],
     diagnostics: {
       mode: "agentic",

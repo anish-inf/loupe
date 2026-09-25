@@ -52,6 +52,7 @@ Resolved in order: `--token` → `GITHUB_TOKEN` → `gh auth token`. Needs
 | `-r, --reasoning <level>` | harness default | `low` \| `medium` \| `high`, passed to the harness natively. |
 | `--prior-comments <policy>` | `resolve` | Prior inline comments on re-review: `resolve` \| `delete` \| `keep`. |
 | `--max-turns <n>` | `10` | Cap on the agentic tool loop. |
+| `--max-comments <n>` | `10` | Max inline comments per review; extras are ranked by severity into a collapsed summary section. |
 | `--no-agentic` | (agentic on) | Review one-shot from the diff, no tool use. |
 | `--profile <name>` | `chill` | Noise: `quiet` \| `chill` \| `assertive`. |
 | `--no-verify` | (verify on) | Skip the verification pass. |

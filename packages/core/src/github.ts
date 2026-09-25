@@ -627,6 +627,8 @@ export type ReviewDiagnostics = {
   readonly crossReviewerDropped: number;
   /** Off-diff notes actually published under "Other notes". */
   readonly offDiff: number;
+  /** Inline findings demoted to the summary by the comment cap. */
+  readonly cappedDropped: number;
   /** Schema-rejected findings kept as notes instead of dropped. */
   readonly salvagedFindings: number;
   /**
@@ -658,7 +660,7 @@ function renderDiagnostics(d: ReviewDiagnostics): string {
     }`,
     `- verification: ${d.verify}`,
     `- scope: ${d.incremental}${d.incremental === "unknown" ? " (history lookup failed; prior comments kept)" : ""}`,
-    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification, ${d.crossReviewerDropped} duplicate of another reviewer`,
+    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification, ${d.cappedDropped} demoted by the comment cap, ${d.crossReviewerDropped} duplicate of another reviewer`,
     `- off-diff notes published: ${d.offDiff}${
       d.salvagedFindings > 0
         ? ` (${d.salvagedFindings} salvaged from malformed finding(s))`
@@ -683,8 +685,9 @@ function statLine(
   review: ReviewOutput,
   fileCount: number,
   degraded: boolean,
+  overflow: readonly Finding[] = [],
 ): string {
-  const all = [...inline, ...review.concerns];
+  const all = [...inline, ...overflow, ...review.concerns];
   const n = (s: Finding["severity"]): number =>
     all.filter((f) => f.severity === s).length;
   const bits: string[] = [];
@@ -820,6 +823,8 @@ export type PostReviewOptions = {
   readonly headPaths?: ReadonlySet<string>;
   /** Files in scope, for the stat line. */
   readonly fileCount: number;
+  /** Findings demoted by the comment cap: counted in tallies, listed collapsed. */
+  readonly overflow?: readonly Finding[];
   /** What to do with prior inline comments (default resolve). */
   readonly priorComments?: PriorComments;
   /** Run diagnostics for the summary; omitted = not rendered. */
@@ -1026,9 +1031,11 @@ export async function postReview(
           scopeFor(opts.refreshPaths, opts.headPaths),
         );
 
-  const hasBlocker = [...inline, ...review.concerns].some(
-    (f) => f.severity === "blocker",
-  );
+  const hasBlocker = [
+    ...inline,
+    ...(opts.overflow ?? []),
+    ...review.concerns,
+  ].some((f) => f.severity === "blocker");
   const title = opts.reviewerName
     ? `loupe · ${opts.reviewerName}`
     : "loupe review";
@@ -1037,7 +1044,13 @@ export async function postReview(
   const shortSha = opts.headSha.slice(0, 7);
   const lastReviewed = `Last reviewed commit: [\`${shortSha}\`](https://github.com/${ref.owner}/${ref.repo}/commit/${opts.headSha})`;
   const degraded = opts.diagnostics ? isDegraded(opts.diagnostics) : false;
-  const stats = statLine(inline, review, opts.fileCount, degraded);
+  const stats = statLine(
+    inline,
+    review,
+    opts.fileCount,
+    degraded,
+    opts.overflow,
+  );
   const summaryBody = renderReviewBody(
     title,
     stats,

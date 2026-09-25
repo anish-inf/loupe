@@ -135,6 +135,18 @@ program
       throw new Error(`Invalid --max-turns "${v}". Use a positive integer.`);
     return n;
   })
+  .option(
+    "--max-comments <n>",
+    "max inline comments per review; extras go to the summary (default 10)",
+    (v) => {
+      const n = Number(v);
+      if (!Number.isInteger(n) || n <= 0)
+        throw new Error(
+          `Invalid --max-comments "${v}". Use a positive integer.`,
+        );
+      return n;
+    },
+  )
   .option("--no-verify", "skip the second-opinion verification pass")
   .option(
     "--no-prompt-cache",
@@ -171,6 +183,7 @@ program
         profile?: string;
         timezone?: string;
         maxTurns?: number;
+        maxComments?: number;
         ensemble?: string;
         skills?: string;
         verify: boolean;
@@ -203,6 +216,7 @@ program
         const timezone = opts.timezone ?? settings.timezone ?? "UTC";
         const dirs = asDirs(opts.dir) ?? settings.dirs;
         const maxTurns = opts.maxTurns ?? settings.maxTurns;
+        const maxComments = opts.maxComments ?? settings.maxComments;
         // --no-prompt-cache explicitly sets false (an override); otherwise defer
         // to the file so a top-level .loupe.json promptCache:false still wins.
         const promptCache =
@@ -243,6 +257,7 @@ program
           skills,
           timezone,
           maxTurns,
+          maxComments,
           priorComments,
           whipConfig: settings.whip,
         };
@@ -280,6 +295,7 @@ program
                 ensembleModels: r.ensemble ?? ensembleModels,
                 skills: r.skills ?? skills,
                 maxTurns: r.maxTurns ?? maxTurns,
+                maxComments: r.maxComments ?? maxComments,
                 priorComments: r.priorComments ?? priorComments,
                 procedure: r.procedure ?? settings.procedure,
                 promptCache: r.promptCache ?? promptCache,
