@@ -1,13 +1,5 @@
 import { spawn } from "node:child_process";
-import {
-  accessSync,
-  chmodSync,
-  mkdirSync,
-  mkdtempSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -16,6 +8,7 @@ import type { Logger } from "@loupe/logger";
 import { HarnessError, classifyHarnessError } from "./errors";
 import type { HarnessTraceEvent } from "./trace";
 import { envSecretValues, redactSecrets } from "./trace";
+import { resolveWhipBinary } from "./whip-binary";
 
 export {
   HarnessError,
@@ -114,133 +107,6 @@ function commandExists(cmd: string): Promise<boolean> {
     p.on("error", () => resolve(false));
     p.on("close", (code) => resolve(code === 0));
   });
-}
-
-/**
- * Run `whip --version` and check the binary identifies itself as genuine whip
- * (output starting with "whip v"). The v1.0.0 release renamed the CLI to
- * whipcode, but many CI install steps still download "latest" and save it as
- * `whip` — so the PATH check passes while the binary is actually whipcode,
- * which reads a different config dir and rejects loupe's model panel:
- *   whipcode: unknown model "glm-5.3" (models: …)
- * A fake `whip` is discarded in favor of the pinned download.
- */
-function isGenuineWhipOnPath(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const p = spawn("whip", ["--version"]);
-    let stdout = "";
-    p.on("error", () => resolve(false));
-    p.on("close", () => resolve(/^\s*whip v/i.test(stdout)));
-    p.stdout?.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-  });
-}
-
-/**
- * whip v0.6.5 — the pinned release loupe installs on demand. The latest whip
- * release (v1.0.0+) renamed the binary to `whipcode` and broke the harness, so
- * when a user selects harness "whip" and no `whip` is on PATH, loupe downloads
- * this exact tag instead of failing with "CLI is not installed."
- */
-const PINNED_WHIP_TAG = "v0.6.5";
-
-/**
- * Install the pinned whip release into loupe's private bin dir (~/.loupe/bin)
- * and return its absolute path, or null on failure. Used as the fallback when
- * the user selected harness "whip" but no usable `whip` binary is available —
- * e.g. after the upstream v1.0.0 release renamed the CLI and the installed
- * `whip` vanished (replaced by `whipcode`), leaving reviews failing with
- * "Harness \"whip\" CLI is not installed."
- */
-function installPinnedWhip(logger: Logger): Promise<string | null> {
-  const home = process.env.HOME ?? tmpdir();
-  const binDir = join(home, ".loupe", "bin");
-  mkdirSync(binDir, { recursive: true });
-  const dest = join(binDir, "whip");
-  // Already downloaded by a previous run — reuse it. The download below is
-  // atomic (staged to a temp file, renamed only on curl success), so a file
-  // at `dest` is always a complete binary; a failed curl can never poison it.
-  try {
-    accessSync(dest);
-    chmodSync(dest, 0o755);
-    return Promise.resolve(dest);
-  } catch {
-    // fall through to a fresh download
-  }
-  const mode =
-    process.platform === "darwin" && process.arch === "arm64"
-      ? "darwin-arm64"
-      : process.platform === "darwin"
-        ? "darwin-x64"
-        : process.platform === "linux" && process.arch === "arm64"
-          ? "linux-arm64"
-          : "linux-x64";
-  const url = `https://github.com/context-labs/whip/releases/download/${PINNED_WHIP_TAG}/whip-${mode}`;
-  // Stage the download in the bin dir so rename stays on the same filesystem.
-  const staging = `${dest}.download-${process.pid}`;
-  return new Promise((resolve) => {
-    const cleanup = (): void => {
-      try {
-        rmSync(staging, { force: true });
-      } catch {
-        // best-effort; a orphaned .download-* temp is harmless
-      }
-    };
-    const child = spawn("curl", ["-fsSL", "--retry", "2", "-o", staging, url]);
-    child.on("error", (err) => {
-      cleanup();
-      logger.warn("pinned whip download failed to start", {
-        error: String(err),
-      });
-      resolve(null);
-    });
-    child.on("close", (code) => {
-      if (code !== 0) {
-        // Remove the partial download so nothing half-written survives.
-        cleanup();
-        logger.warn("pinned whip download failed", { code, url });
-        resolve(null);
-        return;
-      }
-      try {
-        chmodSync(staging, 0o755);
-        // Atomic within the same dir: `dest` only ever exists complete.
-        renameSync(staging, dest);
-        resolve(dest);
-      } catch (err) {
-        cleanup();
-        logger.warn("failed to stage pinned whip", { error: String(err) });
-        resolve(null);
-      }
-    });
-  });
-}
-
-/**
- * Resolve the `whip` binary the whip harness spawns: the `whip` on PATH if it
- * genuinely is whip (identity-checked via `whip --version` — see
- * isGenuineWhipOnPath), else the pinned v0.6.5 release downloaded into loupe's
- * private bin dir. Returns null only when neither is possible (no genuine PATH
- * binary and the download failed). Exported for unit-testing the resolution
- * contract.
- */
-async function resolveWhipBinary(
-  logger: Logger | null,
-): Promise<string | null> {
-  if (await isGenuineWhipOnPath()) return "whip";
-  return installPinnedWhip(
-    logger ??
-      ({
-        // Stub logger so the availability check (a bare boolean probe) can run
-        // without a real Logger; failures here only affect the download path.
-        debug: () => {},
-        info: () => {},
-        warn: () => {},
-        error: () => {},
-        child: () => null as unknown as Logger,
-      } as unknown as Logger),
-  );
 }
 
 /**
@@ -633,13 +499,6 @@ export function whipHarness(): Harness {
     available: () => resolveWhipBinary(null).then((b) => b !== null),
     review: async (ctx) => {
       const binary = (await resolveWhipBinary(ctx.logger)) ?? "whip";
-      if (binary !== "whip") {
-        ctx.logger
-          .child("whip")
-          .info(
-            `no whip on PATH; using pinned ${PINNED_WHIP_TAG} from ${binary}`,
-          );
-      }
       // Agentic reviews need room to explore the checkout with tools; headless
       // diff-only reviews should answer in one turn, capped as a safety net.
       // The agentic cap is configurable (config.json maxTurns / --max-turns).
