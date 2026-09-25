@@ -1014,6 +1014,136 @@ describe("runReview end to end", () => {
     expect(result.summaryBody).toContain("svc/a.ts:2");
   });
 
+  it("unions concerns, highlights, and off-diff notes across surviving ensemble legs (issue #40)", async () => {
+    // Two models both survive. Model A raises an off-diff finding (unusable line)
+    // and a highlight; model B raises the same off-diff finding reworded, plus a
+    // concern and a highlight A didn't have. Before #40's fix, only the first
+    // survivor's review body was kept — B's concern and the union of dropped
+    // notes were silently discarded.
+    const api = fakeOctokit({});
+    const fullReview = JSON.stringify({
+      summary: "reviewed",
+      findings: [
+        // In-scope file, unusable line (far past the 3-line hunk) → salvages
+        // into the off-diff notes.
+        {
+          path: "svc/a.ts",
+          line: 999,
+          severity: "warning",
+          body: "config value is read before initialization",
+        },
+      ],
+      concerns: [],
+      highlights: ["cleanup of the retry loop"],
+    });
+    const { harness } = fakePerModelHarness({
+      "model-a": fullReview,
+      "model-b": JSON.stringify({
+        summary: "reviewed",
+        findings: [
+          // Same off-diff claim reworded by B — unions to one note.
+          {
+            path: "svc/a.ts",
+            line: 999,
+            severity: "warning",
+            body: "config value is read before it is initialized here",
+          },
+        ],
+        concerns: [
+          {
+            title: "Retry budget is shared across request paths",
+            detail:
+              "The retry budget counter is global, so one hot path can starve the others.",
+            severity: "warning",
+          },
+        ],
+        highlights: [
+          "cleanup of the retry loop",
+          "nice test coverage on parse",
+        ],
+      }),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+      }),
+    );
+
+    // The off-diff notes union: both legs' notes survive the union, and the
+    // reworded duplicate collapses to one entry (was: only the first
+    // survivor's single note).
+    expect(result.diagnostics.offDiff).toBe(1);
+    // B's concern survives into the posted review even though A came first.
+    expect(result.summaryBody).toContain("Retry budget is shared");
+    // Highlights union: A's plus B's unique one, deduped overlap.
+    expect(result.summaryBody).toContain("nice test coverage on parse");
+  });
+
+  it("concern merge never downgrades severity, and loose title matches don't merge (Bugbot)", async () => {
+    // Bugbot 1: a later leg's lower-severity concern with a longer writeup
+    // used to replace the first raiser's blocker. Bugbot 2: titles sharing a
+    // prefix used to merge at the 0.1 body threshold, dropping a leg's unique
+    // concern.
+    const api = fakeOctokit({});
+    const { harness } = fakePerModelHarness({
+      "model-a": JSON.stringify({
+        summary: "reviewed",
+        findings: [],
+        concerns: [
+          {
+            title: "Database migration has no rollback path",
+            detail:
+              "The migration adds a column with a default but never documents how to roll it back if deployment aborts halfway.",
+            severity: "blocker",
+          },
+        ],
+        highlights: [],
+      }),
+      "model-b": JSON.stringify({
+        summary: "reviewed",
+        findings: [],
+        concerns: [
+          // Longer detail, lower severity: must NOT replace the blocker.
+          {
+            title: "Database migration lacks a documented rollback procedure",
+            detail:
+              "There is no written procedure describing what an operator should do to roll this migration back if the deployment fails partway through, " +
+              "which would leave the schema in a mixed state with the new column present and the backfill incomplete. " +
+              "Operators would need to reconstruct recovery steps from the migration source by hand under pressure during an incident.",
+            severity: "nit",
+          },
+          // Shares headword, describes a distinct issue: must stay separate.
+          {
+            title: "Database pool sizing is hardcoded",
+            detail:
+              "The connection pool is sized for local development; production traffic would exhaust it before the migration even runs.",
+            severity: "warning",
+          },
+        ],
+        highlights: [],
+      }),
+    });
+
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        ensembleModels: ["model-a", "model-b"],
+      }),
+    );
+
+    // The blocker was reworded by model-b and merged in (same claim, its nit
+    // copy is the longer detail): the posted representative must still be a
+    // blocker — never the reworded nit.
+    const body = result.summaryBody ?? "";
+    const lines = body
+      .split("\n")
+      .filter((l) => l.includes("rollback") || l.includes("hardcoded"));
+    expect(lines.length).toBeGreaterThanOrEqual(2); // both concerns posted
+    const rollbackLine = lines.find((l) => l.includes("rollback"));
+    expect(rollbackLine).toContain("🔴"); // blocker marker preserved
+    expect(body).toContain("Database pool sizing is hardcoded");
+  });
+
   it("a leg that dies on the headless fallback does not taint the survivors' mode", async () => {
     // Bugbot: a dead leg sets counts.mode = "fallback" before its headless
     // retry, then the retry throws too — leaving "fallback" on shared counts.
