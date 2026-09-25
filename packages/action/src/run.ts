@@ -45,6 +45,7 @@ export type RunInput = {
   readonly timezone?: string;
   readonly whipConfig?: WhipConfig;
   readonly maxTurns?: number;
+  readonly maxComments?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
   readonly deferSummary?: boolean;
@@ -109,6 +110,7 @@ export async function reviewPullRequest(
     skills: input.skills,
     timezone: input.timezone,
     maxTurns: input.maxTurns,
+    maxComments: input.maxComments,
     priorComments: input.priorComments,
     procedure: input.procedure,
     deferSummary: input.deferSummary,

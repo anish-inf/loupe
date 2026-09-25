@@ -38,6 +38,8 @@ const reviewerSchema = z
     skills: z.array(z.string()).optional(),
     /** Cap on the agentic tool loop for this reviewer (default 10). */
     maxTurns: z.number().int().positive().optional(),
+    /** Max inline comments for this reviewer; extras go to the summary (default 10). */
+    maxComments: z.number().int().positive().optional(),
     /** What to do with this reviewer's prior inline comments on a re-review. */
     priorComments: z.enum(["resolve", "delete", "keep"]).optional(),
     /** false = drop the always-on review procedure from this reviewer's prompt. */
@@ -78,6 +80,7 @@ const configSchema = z.object({
   /** One directory or several; several are reviewed together from the repo root. */
   dir: z.union([z.string(), z.array(z.string())]).optional(),
   maxTurns: z.number().int().positive().optional(),
+  maxComments: z.number().int().positive().optional(),
   priorComments: z.enum(["resolve", "delete", "keep"]).optional(),
   procedure: z.boolean().optional(),
   whip: whipConfigSchema.optional(),
@@ -93,6 +96,7 @@ export type LoupeSettings = {
   readonly timezone?: string;
   readonly dirs?: readonly string[];
   readonly maxTurns?: number;
+  readonly maxComments?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
   readonly whip?: z.infer<typeof whipConfigSchema>;
@@ -110,6 +114,7 @@ export function loadSettings(configPath: string): LoupeSettings {
     timezone: c.timezone,
     dirs: asDirs(c.dir),
     maxTurns: c.maxTurns,
+    maxComments: c.maxComments,
     priorComments: c.priorComments,
     procedure: c.procedure,
     whip: c.whip,
@@ -130,6 +135,7 @@ export type Reviewer = {
   readonly ensemble?: readonly string[];
   readonly skills?: readonly string[];
   readonly maxTurns?: number;
+  readonly maxComments?: number;
   readonly priorComments?: PriorComments;
   readonly procedure?: boolean;
   readonly dirs?: readonly string[];
@@ -175,6 +181,7 @@ export function loadReviewers(configPath: string): Reviewer[] {
     // Top-level skills apply to every reviewer, plus any reviewer-specific ones.
     skills: [...new Set([...topSkills, ...(r.skills ?? [])])],
     maxTurns: r.maxTurns,
+    maxComments: r.maxComments,
     priorComments: r.priorComments,
     procedure: r.procedure,
     dirs: asDirs(r.dir),

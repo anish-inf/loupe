@@ -28,13 +28,15 @@ flowchart LR
 8. **Anchor.** GitHub only accepts inline comments on lines present in the diff. A finding on an exact diff line stays inline. One within 10 lines snaps to the nearest diff line. Anything else, or on a file not in scope, becomes an off-diff note in the summary.
 9. **Profile filter.** `quiet` keeps blockers, `chill` (default) keeps blockers and warnings, `assertive` keeps everything.
 10. **Verify.** If any inline findings survived and `verify` is on (default), one more headless call asks the same model to mark each `real: true|false`. It may reject a finding only when the diff itself contradicts it; evidence outside the diff is not grounds for rejection. Findings judged not real are dropped and counted. An error, or a verdict set that is not exactly one verdict per finding, keeps them all and marks verification `failed` or `invalid`. An `ensemble` (≥2 models) replaces this step: every model runs the review, only findings a majority agrees on stay inline, and minority findings are surfaced in a collapsed lower-confidence section.
-11. **Post.** See [GitHub objects](./github-objects.md).
+11. **Cap.** If more than `maxComments` findings are still inline, they are ranked by severity (`blocker` > `warning` > `nit`); the top ones stay inline and the rest are listed in a collapsed "Additional findings" section of the summary. A demoted blocker still yields a REQUEST_CHANGES verdict.
+12. **Post.** See [GitHub objects](./github-objects.md).
 
 ## Limits
 
 | Knob | Default | Effect |
 | --- | --- | --- |
 | `maxTurns` | 10 | Agentic tool-loop cap, per reviewer or top level |
+| `maxComments` | 10 | Inline comment cap; ranked-out extras go to the summary |
 | headless cap | 10, fixed | Safety net for the verify pass and the one-shot retry |
 | `reasoning` | harness default | Native effort setting on the harness plus one sentence in the prompt |
 

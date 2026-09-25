@@ -606,6 +606,7 @@ describe("summary rendering", () => {
           profileDropped: 0,
           verifyDropped: 0,
           offDiff: 1,
+          cappedDropped: 0,
         },
       },
     );

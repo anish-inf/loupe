@@ -121,6 +121,7 @@ export async function runReviews(
     verify: config.verify,
     whipConfig: config.whipConfig,
     maxTurns: config.maxTurns,
+    maxComments: config.maxComments,
     full,
   };
 
@@ -162,6 +163,7 @@ export async function runReviews(
             skills: [...new Set([...(r.skills ?? []), ...config.skills])],
             timezone: config.timezone,
             maxTurns: r.maxTurns ?? config.maxTurns,
+            maxComments: r.maxComments ?? config.maxComments,
             priorComments: r.priorComments ?? config.priorComments,
             procedure: r.procedure ?? config.procedure,
             deferSummary: true,

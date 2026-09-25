@@ -556,6 +556,8 @@ export type ReviewDiagnostics = {
   readonly verifyDropped: number;
   /** Off-diff notes actually published under "Other notes". */
   readonly offDiff: number;
+  /** Inline findings demoted to the summary by the comment cap. */
+  readonly cappedDropped: number;
 };
 
 /** True when the run lost or skipped something the reader should know about. */
@@ -576,7 +578,7 @@ function renderDiagnostics(d: ReviewDiagnostics): string {
     }`,
     `- verification: ${d.verify}`,
     `- scope: ${d.incremental}${d.incremental === "unknown" ? " (history lookup failed; prior comments kept)" : ""}`,
-    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification`,
+    `- dropped: ${d.malformedDropped.findings} malformed finding(s), ${d.malformedDropped.concerns} malformed concern(s), ${d.outOfScopeDropped} out of scope, ${d.profileDropped} below profile, ${d.verifyDropped} rejected by verification, ${d.cappedDropped} demoted by the comment cap`,
     `- off-diff notes published: ${d.offDiff}`,
   ];
   return `<details><summary>Run details</summary>\n\n${rows.join("\n")}\n\n</details>`;

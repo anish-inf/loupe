@@ -27,6 +27,7 @@ import {
 import { majority, mergeEnsemble } from "./ensemble";
 import { parseReviewOutput, parseVerification } from "./parse";
 import {
+  severityRank,
   severitiesForProfile,
   type Finding,
   type Profile,
@@ -134,6 +135,13 @@ export type ReviewRequest = {
   readonly timezone?: string;
   /** Cap on the agentic tool loop passed to the harness (default 10). */
   readonly maxTurns?: number;
+  /**
+   * Max inline comments posted per review (default 10). When there are more
+   * findings, they are ranked by severity (blocker > warning > nit), the top
+   * ones go inline, and the rest are listed in a collapsed section of the
+   * summary. A demoted blocker still triggers a REQUEST_CHANGES verdict.
+   */
+  readonly maxComments?: number;
   /** What to do with this reviewer's prior inline comments (default resolve). */
   readonly priorComments?: PriorComments;
   /** Append the always-on review procedure to the system prompt (default true). */
@@ -163,6 +171,9 @@ export type ReviewResult = {
   readonly reviewedHeadSha?: string;
 };
 
+/** Default cap on inline comments posted per review; extras go to the summary. */
+const DEFAULT_MAX_COMMENTS = 10;
+
 const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
   mode: "agentic",
   verify: "skipped",
@@ -172,6 +183,7 @@ const CLEAN_DIAGNOSTICS: ReviewDiagnostics = {
   profileDropped: 0,
   verifyDropped: 0,
   offDiff: 0,
+  cappedDropped: 0,
 };
 
 /** End-to-end: fetch PR + conventions, run the harness, post the review. */
@@ -529,6 +541,22 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     });
   }
 
+  // Comment cap: rank by severity (blocker > warning > nit) so the most
+  // important findings are the inline ones; the rest go to the summary.
+  const maxComments = req.maxComments ?? DEFAULT_MAX_COMMENTS;
+  let overflow: Finding[] = [];
+  if (inline.length > maxComments) {
+    const ranked = [...inline].sort(
+      (a, b) => severityRank(a.severity) - severityRank(b.severity),
+    );
+    inline = ranked.slice(0, maxComments);
+    overflow = ranked.slice(maxComments);
+    logger.info("Capped inline comments", {
+      kept: inline.length,
+      demoted: overflow.length,
+    });
+  }
+
   const diagnostics: ReviewDiagnostics = {
     mode: counts.mode,
     verify,
@@ -541,6 +569,7 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
     profileDropped: counts.profileDropped,
     verifyDropped,
     offDiff: dropped.length,
+    cappedDropped: overflow.length,
   };
 
   // Ensemble minority findings go in a collapsed lower-confidence section.
@@ -550,12 +579,21 @@ export async function runReview(req: ReviewRequest): Promise<ReviewResult> {
           .map((f) => `- \`${f.path}:${f.line}\` [${f.severity}] ${f.body}`)
           .join("\n")}\n\n</details>`
       : "";
+  // Findings demoted by the comment cap go in a collapsed section too, so
+  // nothing is lost — they are just no longer inline comments.
+  const overflowNote =
+    overflow.length > 0
+      ? `\n\n<details><summary>Additional findings (ranked below the ${maxComments}-comment cap)</summary>\n\n${overflow
+          .map((f) => `- \`${f.path}:${f.line}\` [${f.severity}] ${f.body}`)
+          .join("\n")}\n\n</details>`
+      : "";
   const reviewForPost: ReviewOutput = {
     ...review,
-    summary: `${review.summary}${uncertainNote}`,
+    summary: `${review.summary}${uncertainNote}${overflowNote}`,
   };
 
-  const requestedChanges = [...inline, ...review.concerns].some(
+  // A blocker among the demoted findings still requests changes.
+  const requestedChanges = [...inline, ...overflow, ...review.concerns].some(
     (f) => f.severity === "blocker",
   );
   const verdict = requestedChanges ? "REQUEST_CHANGES" : "COMMENT";

@@ -251,6 +251,116 @@ const verifyAll = (n: number) =>
     verdicts: Array.from({ length: n }, (_, i) => ({ index: i, real: true })),
   });
 
+describe("comment cap", () => {
+  // 12 findings: emit nits first, blockers last, to prove ranking, not
+  // emission order, decides what stays inline.
+  const manyFindings = [
+    ...Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "nit",
+      body: `nit ${i}`,
+    })),
+    ...Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "blocker",
+      body: `blocker ${i}`,
+    })),
+  ];
+
+  it("ranks by severity and spills extras into a collapsed summary section", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: reviewJson(manyFindings),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+        profile: "assertive",
+      }),
+    );
+
+    // All five inline comments are blockers, despite the nits being emitted first.
+    expect(result.inlineCount).toBe(5);
+    expect(result.inline.every((f) => f.severity === "blocker")).toBe(true);
+    expect(result.diagnostics.cappedDropped).toBe(7);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).toContain(
+      "Additional findings (ranked below the 5-comment cap)",
+    );
+    expect(body).toContain("`svc/a.ts:2` [nit] nit 0");
+  });
+
+  it("a blocker demoted by the cap still requests changes", async () => {
+    const api = fakeOctokit({});
+    const sixBlockers = Array.from({ length: 6 }, (_, i) => ({
+      path: i % 2 === 0 ? "svc/a.ts" : "svc/b.ts",
+      line: i % 2 === 0 ? 2 : 11,
+      severity: "blocker",
+      body: `blocker ${i}`,
+    }));
+    const { harness } = fakeHarness({ agentic: reviewJson(sixBlockers) });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+      }),
+    );
+
+    expect(result.inlineCount).toBe(5);
+    expect(result.requestedChanges).toBe(true);
+  });
+
+  it("defaults to 10 when maxComments is omitted", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({ agentic: reviewJson(manyFindings) });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        verify: false,
+        profile: "assertive",
+      }),
+    );
+
+    expect(result.inlineCount).toBe(10);
+    expect(result.diagnostics.cappedDropped).toBe(2);
+  });
+
+  it("does nothing when findings are under the cap", async () => {
+    const api = fakeOctokit({});
+    const { harness } = fakeHarness({
+      agentic: reviewJson([
+        {
+          path: "svc/a.ts",
+          line: 2,
+          severity: "warning",
+          body: "w1",
+        },
+      ]),
+    });
+    const result = await runReview(
+      request(api, harness, checkout(), {
+        maxComments: 5,
+        verify: false,
+      }),
+    );
+
+    expect(result.inlineCount).toBe(1);
+    expect(result.diagnostics.cappedDropped).toBe(0);
+    const body = (
+      api.issues.createComment.mock.calls[0]![0] as {
+        body: string;
+      }
+    ).body;
+    expect(body).not.toContain("Additional findings");
+  });
+});
+
 describe("runReview end to end", () => {
   it("incremental run: whole in-scope diff on disk, only B reassessed, A findings dropped, cleanup scoped to B after posting", async () => {
     const api = fakeOctokit({
@@ -313,6 +423,7 @@ describe("runReview end to end", () => {
       profileDropped: 0,
       verifyDropped: 0,
       offDiff: 0,
+      cappedDropped: 0,
     });
 
     // Only B's prior thread resolved, and only after review + summary posted.
