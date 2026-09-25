@@ -46,7 +46,12 @@ jobs:
           echo "Installing whip $tag"
           gh release download "$tag" --repo context-labs/whip --pattern "*-linux-x64" --output whip --clobber
           chmod +x whip
-          sudo mv whip /usr/local/bin/whip
+          # The binary is now named `whipcode`; install it under both names so
+          # loupe's harness lookup works with old and new generations, and any
+          # environment expecting `whip` on PATH keeps working.
+          sudo mv whip /usr/local/bin/whipcode
+          sudo ln -sf /usr/local/bin/whipcode /usr/local/bin/whip
+          whipcode --version || true
           whip --version || true
       - name: Load loupe secrets from Infisical
         continue-on-error: true
