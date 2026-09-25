@@ -32,15 +32,23 @@ import {
   type ReviewDiagnostics,
   type SkipReason,
 } from "./github";
-import { majority, mergeEnsemble } from "./ensemble";
+import {
+  bodySimilarity,
+  dedupeNotes,
+  majority,
+  mergeEnsemble,
+  SIMILARITY_THRESHOLD,
+} from "./ensemble";
 import { parseReviewOutput, parseVerification } from "./parse";
 import {
   severityRank,
   severitiesForProfile,
+  type Concern,
   type Finding,
   type Note,
   type Profile,
   type ReviewOutput,
+  type Severity,
 } from "./types";
 import {
   buildSystemPrompt,
@@ -399,6 +407,113 @@ function reviewForPosting(
     ...review,
     summary: `${review.summary}${uncertainNote}${overflowNote}`,
   };
+}
+
+/**
+ * Merge concerns across ensemble legs (issue #40): concerns aren't line-
+ * anchored, so agreement is decided on title + detail similarity. Legs
+ * raising a similar concern collapse to the strongest representative —
+ * highest severity (per the canonical SEV order, not string comparison),
+ * then fullest detail — while dissimilar ones are all kept, so a concern
+ * raised by only one model is never silently discarded just because it
+ * wasn't first. Order-preserving and deterministic.
+ */
+
+/**
+ * Title similarity needs a stricter gate than finding bodies:
+ * {@link SIMILARITY_THRESHOLD} was calibrated on multi-sentence bodies, but
+ * titles are short prefixes that share vocabulary by convention ("Retry budget
+ * is shared across request paths" vs "Retry loop has no backoff" share
+ * headword trigrams without being the same concern). Calibration on title
+ * pairs: genuine rewordings score >= ~0.39, distinct prefix-sharing titles
+ * mostly < 0.1 with one observed false-positive pair at 0.409 ("Missing error
+ * handling in the parser" vs "Missing null check in the parser"). So require
+ * high title similarity OR moderately-similar titles that share the same
+ * first headword AND corroborate on detail.
+ */
+const CONCERN_TITLE_THRESHOLD = 0.4;
+/** Detail similarity needed to corroborate a title match. A title-only match
+ * merges "Missing error handling…" with "Missing null check…" (0.409), so the
+ * detail must independently agree: true reworded pairs score ~0.24, distinct
+ * issues sharing a prefix ~0.1. */
+const CONCERN_DETAIL_THRESHOLD = 0.15;
+
+/** Two concerns are the same claim when their titles are closely similar AND
+ * the details corroborate, or when titles overlap moderately with the same
+ * first headword and the details strongly corroborate. Both branches demand
+ * detail agreement: unlike findings, a missed concern merge keeps BOTH (the
+ * inclusive outcome — nothing is lost), while a false merge silently drops a
+ * model's concern, so this gate errs strict. */
+function concernSimilar(a: Concern, b: Concern): boolean {
+  const titleSim = bodySimilarity(a.title, b.title);
+  const detailSim = bodySimilarity(a.detail, b.detail);
+  if (
+    titleSim >= CONCERN_TITLE_THRESHOLD &&
+    detailSim >= SIMILARITY_THRESHOLD
+  ) {
+    return true;
+  }
+  return (
+    titleSim >= SIMILARITY_THRESHOLD &&
+    firstWord(a.title) === firstWord(b.title) &&
+    detailSim >= CONCERN_DETAIL_THRESHOLD
+  );
+}
+
+function firstWord(s: string): string {
+  return s.trim().toLowerCase().split(/\s+/)[0] ?? "";
+}
+
+function mergeEnsembleConcerns(
+  concernLists: readonly (readonly Concern[])[],
+): Concern[] {
+  const SEV_ORDER: Record<Severity, number> = {
+    blocker: 2,
+    warning: 1,
+    nit: 0,
+  };
+  const flat: Concern[] = concernLists.flat();
+  const out: Concern[] = [];
+  for (const concern of flat) {
+    const idx = out.findIndex((kept) => concernSimilar(kept, concern));
+    const kept = idx >= 0 ? out[idx] : undefined;
+    if (!kept) {
+      out.push(concern);
+      continue;
+    }
+    // Merge into the strongest representative — but NEVER allow a severity
+    // downgrade: a later model's nit with a longer writeup must not replace
+    // the first raiser's blocker (Bugbot: the posted concern and the
+    // requested-changes verdict would silently drop). Longer detail only
+    // upgrades within the same severity.
+    const higherSev = SEV_ORDER[concern.severity] > SEV_ORDER[kept.severity];
+    if (higherSev) {
+      out[idx] = concern;
+    } else if (
+      SEV_ORDER[concern.severity] === SEV_ORDER[kept.severity] &&
+      concern.detail.length > kept.detail.length
+    ) {
+      out[idx] = concern;
+    }
+  }
+  return out;
+}
+
+/**
+ * Union highlights across ensemble legs (issue #40), deduped by normalized
+ * text. Order-preserving: first leg's highlights first.
+ */
+function mergeHighlights(lists: readonly (readonly string[])[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const h of lists.flat()) {
+    const key = h.toLowerCase().trim();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(h);
+    }
+  }
+  return out;
 }
 
 /** Run the harness and produce a review without posting it. */
@@ -794,16 +909,26 @@ export async function produceReview(
         });
       }
     }
-    // Borrow the review body (summary/concerns/highlights) from the first
-    // surviving leg, not the first configured leg — the first leg may be one
-    // that failed. If no leg survived, let the reviewer-level failure path post
-    // the ⚠️ comment and exit 1 rather than posting a vacuous "clean" review.
+    // Borrow the review narrative (summary) from the first surviving leg, not
+    // the first configured leg — the first leg may be one that failed. Merging
+    // prose summaries across models reads worse than picking one, so the first
+    // survivor's summary wins (tradeoff: later legs' summaries are dropped).
+    // If no leg survived, let the reviewer-level failure path post the ⚠️
+    // comment and exit 1 rather than posting a vacuous "clean" review.
     const [firstSurvivor] = runs;
     if (!firstSurvivor) {
       throw new Error(`all ensemble models failed: ${failedLegs.join(", ")}`);
     }
-    review = firstSurvivor.review;
-    dropped = firstSurvivor.dropped;
+    // Union the structured parts across ALL surviving legs instead of keeping
+    // only the first survivor's — issues #40/#41: every surviving model's
+    // off-diff notes, concerns, and highlights deserve to surface, and the
+    // offDiff diagnostic must count the union, not one leg's slice.
+    review = {
+      ...firstSurvivor.review,
+      concerns: mergeEnsembleConcerns(runs.map((r) => r.review.concerns)),
+      highlights: mergeHighlights(runs.map((r) => r.review.highlights)),
+    };
+    dropped = dedupeNotes(runs.map((r) => r.dropped));
     // Keep the majority threshold relative to the configured panel, not the
     // survivors: a lone survivor's findings have models.size < threshold and
     // flow into the existing lower-confidence section — the honest claim for a
