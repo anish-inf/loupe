@@ -154,20 +154,50 @@ const PINNED_WHIP_TAG = "v0.6.5";
  * "Harness \"whip\" CLI is not installed."
  */
 function installPinnedWhip(logger: Logger): Promise<string | null> {
+  // Single-flight: reviewers run concurrently inside one loupe process, so
+  // simultaneous callers must share one download. The memoized promise makes
+  // every caller await the same install; on failure the memo clears so the
+  // next attempt retries instead of caching the error.
+  const existing = pinnedWhipInstall ?? null;
+  if (existing) return existing;
+  const attempt = installPinnedWhipOnce(logger).then(
+    (result) => {
+      if (pinnedWhipInstall === attempt) pinnedWhipInstall = null;
+      return result;
+    },
+    (err: unknown) => {
+      if (pinnedWhipInstall === attempt) pinnedWhipInstall = null;
+      throw err;
+    },
+  );
+  pinnedWhipInstall = attempt;
+  return attempt;
+}
+
+let pinnedWhipInstall: Promise<string | null> | null = null;
+
+/**
+ * One actual install attempt (see installPinnedWhip for the single-flight
+ * wrapper). Downloads into a unique temp dir and renames into place, so
+ * `dest` only ever exists complete; if another process won the rename while
+ * we were mid-flight, `dest` is a valid binary and we return it.
+ */
+function installPinnedWhipOnce(logger: Logger): Promise<string | null> {
   const home = process.env.HOME ?? tmpdir();
   const binDir = join(home, ".loupe", "bin");
   mkdirSync(binDir, { recursive: true });
   const dest = join(binDir, "whip");
-  // Already downloaded by a previous run — reuse it. The download below is
-  // atomic (staged to a temp file, renamed only on curl success), so a file
-  // at `dest` is always a complete binary; a failed curl can never poison it.
-  try {
-    accessSync(dest);
-    chmodSync(dest, 0o755);
-    return Promise.resolve(dest);
-  } catch {
-    // fall through to a fresh download
-  }
+  const isInstalled = (): boolean => {
+    try {
+      accessSync(dest);
+      chmodSync(dest, 0o755);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  // Already downloaded by a previous run — reuse it.
+  if (isInstalled()) return Promise.resolve(dest);
   const mode =
     process.platform === "darwin" && process.arch === "arm64"
       ? "darwin-arm64"
@@ -177,14 +207,17 @@ function installPinnedWhip(logger: Logger): Promise<string | null> {
           ? "linux-arm64"
           : "linux-x64";
   const url = `https://github.com/context-labs/whip/releases/download/${PINNED_WHIP_TAG}/whip-${mode}`;
-  // Stage the download in the bin dir so rename stays on the same filesystem.
-  const staging = `${dest}.download-${process.pid}`;
+  // Unique staging dir per attempt (mkdtemp), so neither same-process
+  // concurrency nor a same-machine second process collides on the temp file.
+  // Inside binDir so renameSync stays on the same filesystem.
+  const stagingDir = mkdtempSync(join(binDir, ".download-"));
+  const staging = join(stagingDir, "whip");
   return new Promise((resolve) => {
     const cleanup = (): void => {
       try {
-        rmSync(staging, { force: true });
+        rmSync(stagingDir, { recursive: true, force: true });
       } catch {
-        // best-effort; a orphaned .download-* temp is harmless
+        // best-effort; an orphaned .download-* temp dir is harmless
       }
     };
     const child = spawn("curl", ["-fsSL", "--retry", "2", "-o", staging, url]);
@@ -197,21 +230,28 @@ function installPinnedWhip(logger: Logger): Promise<string | null> {
     });
     child.on("close", (code) => {
       if (code !== 0) {
-        // Remove the partial download so nothing half-written survives.
+        // A concurrent winner may have finished while we were downloading.
         cleanup();
         logger.warn("pinned whip download failed", { code, url });
-        resolve(null);
+        resolve(isInstalled() ? dest : null);
         return;
       }
       try {
         chmodSync(staging, 0o755);
-        // Atomic within the same dir: `dest` only ever exists complete.
-        renameSync(staging, dest);
+        // Atomic within the same filesystem: `dest` only ever exists complete.
+        // If another attempt renamed first, its binary is valid — use it.
+        try {
+          renameSync(staging, dest);
+        } catch {
+          if (!isInstalled()) throw new Error("rename failed and no dest");
+        }
         resolve(dest);
       } catch (err) {
         cleanup();
         logger.warn("failed to stage pinned whip", { error: String(err) });
-        resolve(null);
+        resolve(isInstalled() ? dest : null);
+      } finally {
+        cleanup();
       }
     });
   });
