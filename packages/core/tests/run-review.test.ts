@@ -509,6 +509,14 @@ describe("comment cap", () => {
 
     expect(result.inlineCount).toBe(5);
     expect(result.requestedChanges).toBe(true);
+    // The posted review event must carry the verdict even though every
+    // blocker's copy beyond the cap was demoted to the summary.
+    const reviewCall = (
+      api.pulls.createReview as unknown as {
+        mock: { calls: { event: string }[][] };
+      }
+    ).mock.calls[0]![0]!;
+    expect(reviewCall.event).toBe("REQUEST_CHANGES");
   });
 
   it("defaults to 10 when maxComments is omitted", async () => {

@@ -1031,9 +1031,11 @@ export async function postReview(
           scopeFor(opts.refreshPaths, opts.headPaths),
         );
 
-  const hasBlocker = [...inline, ...review.concerns].some(
-    (f) => f.severity === "blocker",
-  );
+  const hasBlocker = [
+    ...inline,
+    ...(opts.overflow ?? []),
+    ...review.concerns,
+  ].some((f) => f.severity === "blocker");
   const title = opts.reviewerName
     ? `loupe · ${opts.reviewerName}`
     : "loupe review";
