@@ -262,6 +262,38 @@ describe("mergeEnsemble", () => {
     expect(confirmed[0]!.severity).toBe("blocker"); // stronger rep kept
     expect(uncertain.map((c) => c.path).sort()).toEqual(["y.ts", "z.ts"]);
   });
+  it("matches agreements across an intervening dissimilar finding (Bugbot: clustering scan-back)", () => {
+    // Bugbot: the single-pass clusterer only compared against the LAST
+    // cluster's anchor, which held for pure line distance but not once
+    // agreement gained a textual term — a dissimilar finding between two
+    // agreeing ones started a new cluster and hid the match.
+    const f = (
+      path: string,
+      line: number,
+      body: string,
+      severity: "blocker" | "warning" | "nit" = "warning",
+    ) => ({ path, line, severity, body });
+    const a = [
+      f(
+        "x.ts",
+        10,
+        "SQL injection: user input flows into the query unparameterized",
+      ),
+    ];
+    const b = [
+      // Different bug on the same lines, from the same model — splits the stream.
+      f("x.ts", 11, "The file handle is never closed after parsing"),
+      // Same bug as a, reworded: must match x.ts:10 despite the intervening note.
+      f(
+        "x.ts",
+        12,
+        "SQL injection risk: query built from unescaped user input",
+      ),
+    ];
+    const { confirmed, uncertain } = mergeEnsemble([a, b], majority(2));
+    expect(confirmed.map((c) => `${c.path}:${c.line}`)).toEqual(["x.ts:10"]);
+    expect(uncertain.map((c) => `${c.path}:${c.line}`)).toEqual(["x.ts:11"]);
+  });
   it("majority is 2 of 2 and 2 of 3", () => {
     expect(majority(2)).toBe(2);
     expect(majority(3)).toBe(2);
@@ -408,6 +440,19 @@ describe("dedupeNotes", () => {
       merged.some((m) => m.path === "api.ts" && m.body.includes("retry")),
     ).toBe(true);
   });
+  it("collapses reworded duplicates even when another note on the path sorts between them", () => {
+    // Bugbot: dedupeNotes previously sorted bodies lexicographically and only
+    // compared against the last kept note, so a third note sitting between
+    // two reworded copies hid the match.
+    const merged = dedupeNotes([
+      [n("cfg.ts", "config value read before initialization")],
+      [n("cfg.ts", "api token rotation not implemented")],
+      [n("cfg.ts", "config value is read before it is initialized")],
+    ]);
+    const cfgNotes = merged.filter((m) => m.path === "cfg.ts");
+    expect(cfgNotes).toHaveLength(2); // reworded duplicate collapses
+    expect(cfgNotes.some((m) => m.body.includes("rotation"))).toBe(true);
+  });
   it("keeps notes whose line differs or is absent — line is not part of agreement", () => {
     const merged = dedupeNotes([
       [n("svc.ts", "identical off-diff note", 7)],
@@ -473,6 +518,43 @@ describe("dedupeFindings", () => {
     expect(rb.suppressed).toBe(0);
   });
 
+  it("deduplicates a reworded copy despite an intervening dissimilar finding (Bugbot: clustering scan-back)", () => {
+    const a = [
+      f(
+        "svc/db.ts",
+        20,
+        "blocker",
+        "connection pool never returns connections on error paths",
+      ),
+    ];
+    const b = [
+      // Different bug in between — must not hide the reworded duplicate below.
+      f(
+        "svc/db.ts",
+        21,
+        "warning",
+        "query timeout is not propagated to the caller",
+      ),
+      f(
+        "svc/db.ts",
+        22,
+        "warning",
+        "connection pool leaks: connections are not freed on error",
+      ),
+    ];
+    const res = dedupeFindings([
+      { reviewer: "bugs", findings: a },
+      { reviewer: "sec", findings: b },
+    ]);
+    const ra = res[0]!;
+    const rb = res[1]!;
+    // The pool bug posts once (owned by bugs, the blocker); the timeout bug
+    // survives untouched; sec's duplicate is suppressed.
+    expect(ra.inline).toHaveLength(1);
+    expect(rb.inline).toHaveLength(1);
+    expect(rb.inline[0]!.body).toContain("timeout");
+    expect(rb.suppressed).toBe(1);
+  });
   it("attributes the survivor to the reviewer with the strongest finding", () => {
     const a = [f("y.ts", 5, "nit")];
     const b = [f("y.ts", 6, "blocker")];

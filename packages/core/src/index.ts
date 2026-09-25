@@ -345,16 +345,50 @@ function reviewForPosting(
  * raised by only one model is never silently discarded just because it
  * wasn't first. Order-preserving and deterministic.
  */
-/** Two concerns are the same claim when their titles are similar, or when both
- * title and detail are close enough — a looser title match is allowed when the
- * detail independently corroborates it. */
+
+/**
+ * Title similarity needs a stricter gate than finding bodies:
+ * {@link SIMILARITY_THRESHOLD} was calibrated on multi-sentence bodies, but
+ * titles are short prefixes that share vocabulary by convention ("Retry budget
+ * is shared across request paths" vs "Retry loop has no backoff" share
+ * headword trigrams without being the same concern). Calibration on title
+ * pairs: genuine rewordings score >= ~0.39, distinct prefix-sharing titles
+ * mostly < 0.1 with one observed false-positive pair at 0.409 ("Missing error
+ * handling in the parser" vs "Missing null check in the parser"). So require
+ * high title similarity OR moderately-similar titles that share the same
+ * first headword AND corroborate on detail.
+ */
+const CONCERN_TITLE_THRESHOLD = 0.4;
+/** Detail similarity needed to corroborate a title match. A title-only match
+ * merges "Missing error handling…" with "Missing null check…" (0.409), so the
+ * detail must independently agree: true reworded pairs score ~0.24, distinct
+ * issues sharing a prefix ~0.1. */
+const CONCERN_DETAIL_THRESHOLD = 0.15;
+
+/** Two concerns are the same claim when their titles are closely similar AND
+ * the details corroborate, or when titles overlap moderately with the same
+ * first headword and the details strongly corroborate. Both branches demand
+ * detail agreement: unlike findings, a missed concern merge keeps BOTH (the
+ * inclusive outcome — nothing is lost), while a false merge silently drops a
+ * model's concern, so this gate errs strict. */
 function concernSimilar(a: Concern, b: Concern): boolean {
   const titleSim = bodySimilarity(a.title, b.title);
-  if (titleSim >= SIMILARITY_THRESHOLD) return true;
+  const detailSim = bodySimilarity(a.detail, b.detail);
+  if (
+    titleSim >= CONCERN_TITLE_THRESHOLD &&
+    detailSim >= SIMILARITY_THRESHOLD
+  ) {
+    return true;
+  }
   return (
-    titleSim >= SIMILARITY_THRESHOLD / 2 &&
-    bodySimilarity(a.detail, b.detail) >= SIMILARITY_THRESHOLD
+    titleSim >= SIMILARITY_THRESHOLD &&
+    firstWord(a.title) === firstWord(b.title) &&
+    detailSim >= CONCERN_DETAIL_THRESHOLD
   );
+}
+
+function firstWord(s: string): string {
+  return s.trim().toLowerCase().split(/\s+/)[0] ?? "";
 }
 
 function mergeEnsembleConcerns(
@@ -368,21 +402,25 @@ function mergeEnsembleConcerns(
   const flat: Concern[] = concernLists.flat();
   const out: Concern[] = [];
   for (const concern of flat) {
-    const dup = out.some((kept) => concernSimilar(kept, concern));
-    if (dup) {
-      // Replace with the stronger version when needed — but don't reorder:
-      // position in the list stays the first raiser's.
-      const idx = out.findIndex((kept) => concernSimilar(kept, concern));
-      const kept = idx >= 0 ? out[idx] : undefined;
-      if (
-        idx >= 0 &&
-        kept &&
-        (SEV_ORDER[concern.severity] > SEV_ORDER[kept.severity] ||
-          concern.detail.length > kept.detail.length)
-      )
-        out[idx] = concern;
-    } else {
+    const idx = out.findIndex((kept) => concernSimilar(kept, concern));
+    const kept = idx >= 0 ? out[idx] : undefined;
+    if (!kept) {
       out.push(concern);
+      continue;
+    }
+    // Merge into the strongest representative — but NEVER allow a severity
+    // downgrade: a later model's nit with a longer writeup must not replace
+    // the first raiser's blocker (Bugbot: the posted concern and the
+    // requested-changes verdict would silently drop). Longer detail only
+    // upgrades within the same severity.
+    const higherSev = SEV_ORDER[concern.severity] > SEV_ORDER[kept.severity];
+    if (higherSev) {
+      out[idx] = concern;
+    } else if (
+      SEV_ORDER[concern.severity] === SEV_ORDER[kept.severity] &&
+      concern.detail.length > kept.detail.length
+    ) {
+      out[idx] = concern;
     }
   }
   return out;
