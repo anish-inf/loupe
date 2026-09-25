@@ -115,6 +115,27 @@ function commandExists(cmd: string): Promise<boolean> {
 }
 
 /**
+ * Run `whip --version` and check the binary identifies itself as genuine whip
+ * (output starting with "whip v"). The v1.0.0 release renamed the CLI to
+ * whipcode, but many CI install steps still download "latest" and save it as
+ * `whip` — so the PATH check passes while the binary is actually whipcode,
+ * which reads a different config dir and rejects loupe's model panel:
+ *   whipcode: unknown model "glm-5.3" (models: …)
+ * A fake `whip` is discarded in favor of the pinned download.
+ */
+function isGenuineWhipOnPath(): Promise<boolean> {
+  return new Promise((resolve) => {
+    const p = spawn("whip", ["--version"]);
+    let stdout = "";
+    p.on("error", () => resolve(false));
+    p.on("close", () => resolve(/^\s*whip v/i.test(stdout)));
+    p.stdout?.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+  });
+}
+
+/**
  * whip v0.6.5 — the pinned release loupe installs on demand. The latest whip
  * release (v1.0.0+) renamed the binary to `whipcode` and broke the harness, so
  * when a user selects harness "whip" and no `whip` is on PATH, loupe downloads
@@ -177,15 +198,17 @@ function installPinnedWhip(logger: Logger): Promise<string | null> {
 }
 
 /**
- * Resolve the `whip` binary the whip harness spawns: the `whip` on PATH if
- * present, else the pinned v0.6.5 release downloaded into loupe's private bin
- * dir. Returns null only when neither is possible (no PATH binary and the
- * download failed). Exported for unit-testing the resolution contract.
+ * Resolve the `whip` binary the whip harness spawns: the `whip` on PATH if it
+ * genuinely is whip (identity-checked via `whip --version` — see
+ * isGenuineWhipOnPath), else the pinned v0.6.5 release downloaded into loupe's
+ * private bin dir. Returns null only when neither is possible (no genuine PATH
+ * binary and the download failed). Exported for unit-testing the resolution
+ * contract.
  */
 async function resolveWhipBinary(
   logger: Logger | null,
 ): Promise<string | null> {
-  if (await commandExists("whip")) return "whip";
+  if (await isGenuineWhipOnPath()) return "whip";
   return installPinnedWhip(
     logger ??
       ({
