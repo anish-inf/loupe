@@ -109,18 +109,6 @@ function commandExists(cmd: string): Promise<boolean> {
 }
 
 /**
- * The whip CLI was renamed to `whipcode`. Return the first installed binary
- * name so loupe works with either generation of the harness, and null when
- * neither is on PATH.
- */
-async function resolveWhipBinary(): Promise<string | null> {
-  for (const cmd of ["whipcode", "whip"]) {
-    if (await commandExists(cmd)) return cmd;
-  }
-  return null;
-}
-
-/**
  * Run a command, feed `stdin` in, resolve with stdout. stderr is streamed to the
  * logger at debug (live visibility into what the agent is doing), and the full
  * stdout is logged at debug on completion so an empty or non-JSON response is
@@ -247,7 +235,6 @@ export function codexHarness(): Harness {
 function runWhipStreaming(
   args: readonly string[],
   ctx: HarnessContext,
-  binary = "whip",
 ): Promise<string> {
   const log = ctx.logger.child("whip");
   // Known secrets (resolved credential values handed to the subprocess via env)
@@ -276,7 +263,7 @@ function runWhipStreaming(
     });
   log.debug("Spawning harness", { args, cwd: ctx.workdir, model: ctx.model });
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, {
+    const child = spawn("whip", args, {
       cwd: ctx.workdir,
       env: { ...process.env, ...ctx.env },
     });
@@ -493,9 +480,7 @@ export function shouldRetryWithoutCacheKey(
 
 /**
  * whip (context-labs custom harness): runs `whip run --format json` and streams
- * the event log live. The binary was renamed from `whip` to `whipcode` —
- * loupe prefers `whipcode` and falls back to a legacy `whip` install.
- * `-system` sets the reviewer/output/headless instructions.
+ * the event log live. `-system` sets the reviewer/output/headless instructions.
  * By default it self-authenticates from its own local login (~/.whip/); when a
  * `whipConfig` is supplied, loupe writes a throwaway WHIP_HOME config declaring
  * the provider + model panel instead. `-max-turns` caps the tool loop as a
@@ -505,9 +490,8 @@ export function whipHarness(): Harness {
   return {
     name: "whip",
     credentialKeys: [],
-    available: () => resolveWhipBinary().then((b) => b !== null),
-    review: async (ctx) => {
-      const binary = (await resolveWhipBinary()) ?? "whipcode";
+    available: () => commandExists("whip"),
+    review: (ctx) => {
       // Agentic reviews need room to explore the checkout with tools; headless
       // diff-only reviews should answer in one turn, capped as a safety net.
       // The agentic cap is configurable (config.json maxTurns / --max-turns).
@@ -525,14 +509,7 @@ export function whipHarness(): Harness {
       ];
       if (ctx.model) args.push("-m", ctx.model);
       const whipEnv: Record<string, string> = ctx.whipConfig
-        ? (() => {
-            const env = materializeWhipHome(ctx.whipConfig, ctx.reasoning);
-            // whip v0.x reads WHIP_HOME/~/.whip; whipcode v1+ renamed both the
-            // binary and its env override (WHIPCODE_HOME/~/.whipcode). Point
-            // whichever generation is installed at the temp config dir.
-            const home = env.WHIP_HOME as string;
-            return binary === "whipcode" ? { WHIPCODE_HOME: home } : env;
-          })()
+        ? materializeWhipHome(ctx.whipConfig, ctx.reasoning)
         : {};
       if (ctx.reasoning && !ctx.whipConfig) {
         ctx.logger
@@ -548,7 +525,7 @@ export function whipHarness(): Harness {
       const withKey = ctx.cacheKey
         ? [...args, "-cache-key", ctx.cacheKey]
         : args;
-      return runWhipStreaming(withKey, runCtx, binary).catch((err: unknown) => {
+      return runWhipStreaming(withKey, runCtx).catch((err: unknown) => {
         // A reviewer that opted out via promptCache:false has cacheKey
         // undefined, so this never fires for it — no wasted retry.
         if (shouldRetryWithoutCacheKey(err, ctx.cacheKey)) {
@@ -558,7 +535,7 @@ export function whipHarness(): Harness {
               "prompt cache key rejected; retrying without it. " +
                 "Set promptCache:false to skip this retry.",
             );
-          return runWhipStreaming(args, runCtx, binary);
+          return runWhipStreaming(args, runCtx);
         }
         throw err;
       });
