@@ -1,5 +1,11 @@
 import { spawn } from "node:child_process";
-import { accessSync, chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import {
+  accessSync,
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -137,24 +143,17 @@ function installPinnedWhip(logger: Logger): Promise<string | null> {
   } catch {
     // fall through to a fresh download
   }
-  const mode = process.platform === "darwin" && process.arch === "arm64"
-    ? "darwin-arm64"
-    : process.platform === "darwin"
-      ? "darwin-x64"
-      : process.platform === "linux" && process.arch === "arm64"
-        ? "linux-arm64"
-        : "linux-x64";
-  const url =
-    `https://github.com/context-labs/whip/releases/download/${PINNED_WHIP_TAG}/whip-${mode}`;
+  const mode =
+    process.platform === "darwin" && process.arch === "arm64"
+      ? "darwin-arm64"
+      : process.platform === "darwin"
+        ? "darwin-x64"
+        : process.platform === "linux" && process.arch === "arm64"
+          ? "linux-arm64"
+          : "linux-x64";
+  const url = `https://github.com/context-labs/whip/releases/download/${PINNED_WHIP_TAG}/whip-${mode}`;
   return new Promise((resolve) => {
-    const child = spawn("curl", [
-      "-fsSL",
-      "--retry",
-      "2",
-      "-o",
-      dest,
-      url,
-    ]);
+    const child = spawn("curl", ["-fsSL", "--retry", "2", "-o", dest, url]);
     child.on("error", (err) => {
       logger.warn("pinned whip download failed to start", {
         error: String(err),
@@ -188,15 +187,16 @@ async function resolveWhipBinary(
 ): Promise<string | null> {
   if (await commandExists("whip")) return "whip";
   return installPinnedWhip(
-    logger ?? {
-      // Stub logger so the availability check (a bare boolean probe) can run
-      // without a real Logger; failures here only affect the download path.
-      debug: () => {},
-      info: () => {},
-      warn: () => {},
-      error: () => {},
-      child: () => null as unknown as Logger,
-    } as unknown as Logger,
+    logger ??
+      ({
+        // Stub logger so the availability check (a bare boolean probe) can run
+        // without a real Logger; failures here only affect the download path.
+        debug: () => {},
+        info: () => {},
+        warn: () => {},
+        error: () => {},
+        child: () => null as unknown as Logger,
+      } as unknown as Logger),
   );
 }
 
@@ -591,9 +591,11 @@ export function whipHarness(): Harness {
     review: async (ctx) => {
       const binary = (await resolveWhipBinary(ctx.logger)) ?? "whip";
       if (binary !== "whip") {
-        ctx.logger.child("whip").info(
-          `no whip on PATH; using pinned ${PINNED_WHIP_TAG} from ${binary}`,
-        );
+        ctx.logger
+          .child("whip")
+          .info(
+            `no whip on PATH; using pinned ${PINNED_WHIP_TAG} from ${binary}`,
+          );
       }
       // Agentic reviews need room to explore the checkout with tools; headless
       // diff-only reviews should answer in one turn, capped as a safety net.
