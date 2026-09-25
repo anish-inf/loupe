@@ -4,6 +4,8 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -135,7 +137,9 @@ function installPinnedWhip(logger: Logger): Promise<string | null> {
   const binDir = join(home, ".loupe", "bin");
   mkdirSync(binDir, { recursive: true });
   const dest = join(binDir, "whip");
-  // Already downloaded by a previous run — reuse it.
+  // Already downloaded by a previous run — reuse it. The download below is
+  // atomic (staged to a temp file, renamed only on curl success), so a file
+  // at `dest` is always a complete binary; a failed curl can never poison it.
   try {
     accessSync(dest);
     chmodSync(dest, 0o755);
@@ -152,9 +156,19 @@ function installPinnedWhip(logger: Logger): Promise<string | null> {
           ? "linux-arm64"
           : "linux-x64";
   const url = `https://github.com/context-labs/whip/releases/download/${PINNED_WHIP_TAG}/whip-${mode}`;
+  // Stage the download in the bin dir so rename stays on the same filesystem.
+  const staging = `${dest}.download-${process.pid}`;
   return new Promise((resolve) => {
-    const child = spawn("curl", ["-fsSL", "--retry", "2", "-o", dest, url]);
+    const cleanup = (): void => {
+      try {
+        rmSync(staging, { force: true });
+      } catch {
+        // best-effort; a orphaned .download-* temp is harmless
+      }
+    };
+    const child = spawn("curl", ["-fsSL", "--retry", "2", "-o", staging, url]);
     child.on("error", (err) => {
+      cleanup();
       logger.warn("pinned whip download failed to start", {
         error: String(err),
       });
@@ -162,14 +176,20 @@ function installPinnedWhip(logger: Logger): Promise<string | null> {
     });
     child.on("close", (code) => {
       if (code !== 0) {
+        // Remove the partial download so nothing half-written survives.
+        cleanup();
         logger.warn("pinned whip download failed", { code, url });
         resolve(null);
+        return;
       }
       try {
-        chmodSync(dest, 0o755);
+        chmodSync(staging, 0o755);
+        // Atomic within the same dir: `dest` only ever exists complete.
+        renameSync(staging, dest);
         resolve(dest);
       } catch (err) {
-        logger.warn("failed to chmod pinned whip", { error: String(err) });
+        cleanup();
+        logger.warn("failed to stage pinned whip", { error: String(err) });
         resolve(null);
       }
     });
